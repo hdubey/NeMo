@@ -1804,3 +1804,61 @@ class FrameBatchASRModified(FrameBatchASR):
         features = self._get_feature_from_buffer()
         self.feature_buffer[:, : -self.feature_chunk_len] = self.feature_buffer[:, self.feature_chunk_len:].clone()
         self.feature_buffer[:, -self.feature_chunk_len:] = features.clone()
+
+
+    def transcribe(self, tokens_per_chunk: int, delay: int, keep_logits: bool = False):
+        self.infer_logits(keep_logits)
+        self.unmerged = []
+        first_segment = False
+
+        for pred_idx, pred in enumerate(self.all_preds):
+            decoded = pred.tolist()
+            middle = decoded[len(decoded) - 1 - delay : len(decoded) - 1 - delay + tokens_per_chunk]
+
+            # check if it is first buffer
+            if not first_segment:
+                for i in middle:
+                    if i != self.blank_id:
+                        first_segment = True
+                        break
+                if first_segment:
+                    self.unmerged += decoded[0 : len(decoded) - 1 - delay]  # add left padding transcription
+
+            # always add middle transcript
+            self.unmerged += middle
+
+            # Check if it is last 5 processing buffer (800ms) 
+            if pred_idx < len(self.all_preds) - 5:
+                for i in middle:
+                    if i!= self.blank_id:
+                        self.unmerged += decoded[len(decoded) - 1 - delay + tokens_per_chunk:] # add right padding transcription
+
+        hypothesis = self.greedy_merge(self.unmerged)
+        if not keep_logits:
+            return hypothesis
+
+        all_logits = []
+        for log_prob_idx, log_prob in enumerate(self.all_logits):
+            T = log_prob.shape[0]
+
+            # Handling the first buffer
+            if log_prob_idx == 0:
+                log_prob_left = log_prob[0:T - 1 - delay, :]
+                log_prob_middle = log_prob[T - 1 - delay:T - 1 - delay + tokens_per_chunk, :]
+                all_logits.append(log_prob_left)
+                all_logits.append(log_prob_middle)
+
+            # Handling last 5 buffers
+            elif log_prob_idx >= len(self.all_logits) - 5:
+                log_prob_middle = log_prob[T - 1 - delay:T - 1 - delay + tokens_per_chunk, :]
+                log_prob_right = log_prob[T - 1 - delay + tokens_per_chunk:, :]
+
+                all_logits.append(log_prob_middle)
+                all_logits.append(log_prob_right)
+
+            else:
+                log_prob_middle = log_prob[T - 1 - delay:T - 1 - delay + tokens_per_chunk, :]
+                all_logits.append(log_prob_middle)
+
+            all_logits = torch.concat(all_logits, 0)
+            return hypothesis, all_logits
