@@ -842,7 +842,7 @@ class FrameBatchASR:
             self.unmerged += middle # always retain middle transcription
 
             # Process the last chunk
-            for pred_idx == len(self.all_preds) - 1:
+            if pred_idx == len(self.all_preds) - 1:
                 self.unmerged += decoded[len(decoded) - 1 - delay + tokens_per_chunk:]
 
         hypothesis = self.greedy_merge(self.unmerged)
