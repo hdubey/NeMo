@@ -824,9 +824,7 @@ class FrameBatchASR:
         self.infer_logits(keep_logits)
         self.unmerged = []
         first_segment = False
-        # last_segment = False
 
-        # audio_length = len(self.all_preds)*chunk_len_in_secs
         # Process each chunk
         for pred_idx, pred in enumerate(self.all_preds):
         # for pred in self.all_preds:
@@ -840,8 +838,7 @@ class FrameBatchASR:
                         break
                 if first_segment:
                     self.unmerged += decoded[0 : len(decoded) - 1 - delay] # add left padding transcription
-
-
+                    
             self.unmerged += middle # always retain middle transcription
 
             # Process the last chunk
@@ -857,15 +854,12 @@ class FrameBatchASR:
 
         for log_prob in self.all_logits:
             T = log_prob.shape[0]
-
             if not first_segment:
                 first_segment_logits = log_prob[0 : T - 1 - delay, :]
                 all_logits.append(first_segment_logits)
                 first_segment = True
-
             middle_logits = log_prob[T - 1 - delay : T - 1 - delay + tokens_per_chunk, :]
             all_logits.append(middle_logits)
-
             # Process the last chunk
             if log_prob is self.all_logits[-1]:
                 last_segment_logits = log_prob[T - 1 - delay + tokens_per_chunk:, :]
