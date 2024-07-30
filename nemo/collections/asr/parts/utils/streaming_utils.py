@@ -665,7 +665,6 @@ class FeatureFrameBufferer:
             else:
                 self.buffer[:, :-curr_frame_len] = self.buffer[:, curr_frame_len:]
                 self.buffer[:, -curr_frame_len:] = frame
-                self.buffer[:, -self.n_frame_len:] = frame
 
             self.frame_buffers.append(np.copy(self.buffer))
         return self.frame_buffers
