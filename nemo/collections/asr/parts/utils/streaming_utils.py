@@ -640,6 +640,37 @@ class FeatureFrameBufferer:
 
         return batch_frames
 
+    def get_frame_buffers(self, frames, right_delay=0.0):
+        # Ensure right_delay is an integer multiple of frame length
+        if right_delay % self.frame_len != 0:
+            raise ValueError("right_delay must be an integer multiple of frame_len")
+
+        # Convert right_delay to feature frames
+        right_delay_frames = int(right_delay / self.asr_model._cfg.preprocessor.window_stride)
+
+        # Build buffers for each frame
+        self.frame_buffers = []
+        for frame in frames:
+            curr_frame_len = frame.shape[1]
+            self.buffered_len += curr_frame_len
+
+            if curr_frame_len < self.feature_buffer_len and not self.pad_to_buffer_len:
+                self.frame_buffers.append(np.copy(frame))
+                continue
+
+            if right_delay > 0:
+                self.buffer[:, :-curr_frame_len - right_delay_frames] = self.buffer[:, curr_frame_len:-right_delay_frames]
+                self.buffer[:, -curr_frame_len - right_delay_frames: -right_delay_frames] = frame
+                self.buffer[:, -right_delay_frames:] = self.ZERO_LEVEL_SPEC_DB_VAL
+            else:
+                self.buffer[:, :-curr_frame_len] = self.buffer[:, curr_frame_len:]
+                self.buffer[:, -curr_frame_len:] = frame
+                self.buffer[:, -self.n_frame_len:] = frame
+
+            self.frame_buffers.append(np.copy(self.buffer))
+        return self.frame_buffers
+
+'''
     def get_frame_buffers(self, frames):
         # Build buffers for each frame
         self.frame_buffers = []
@@ -653,7 +684,7 @@ class FeatureFrameBufferer:
             self.buffer[:, -self.n_frame_len :] = frame
             self.frame_buffers.append(np.copy(self.buffer))
         return self.frame_buffers
-
+'''
     def set_frame_reader(self, frame_reader):
         self.frame_reader = frame_reader
         self.signal_end = False
