@@ -823,20 +823,74 @@ class FrameBatchASR:
     def transcribe(self, tokens_per_chunk: int, delay: int, keep_logits: bool = False):
         self.infer_logits(keep_logits)
         self.unmerged = []
-        for pred in self.all_preds:
+        first_segment = False
+        # last_segment = False
+
+        # audio_length = len(self.all_preds)*chunk_len_in_secs
+        # Process each chunk
+        for pred_idx, pred in enumerate(self.all_preds):
+        # for pred in self.all_preds:
             decoded = pred.tolist()
-            self.unmerged += decoded[len(decoded) - 1 - delay : len(decoded) - 1 - delay + tokens_per_chunk]
+            middle = decoded[len(decoded) - 1 - delay : len(decoded) - 1 - delay + tokens_per_chunk]
+
+            if not first_segment:
+                for i in middle:
+                    if i != self.blank_id:
+                        first_segment = True
+                        break
+                if first_segment:
+                    self.unmerged += decoded[0 : len(decoded) - 1 - delay] # add left padding transcription
+
+
+            self.unmerged += middle # always retain middle transcription
+
+            # Process the last chunk
+            for pred_idx == len(self.all_preds) - 1:
+                self.unmerged += decoded[len(decoded) - 1 - delay + tokens_per_chunk:]
+
         hypothesis = self.greedy_merge(self.unmerged)
         if not keep_logits:
             return hypothesis
 
         all_logits = []
+        first_segment = False
+
         for log_prob in self.all_logits:
             T = log_prob.shape[0]
-            log_prob = log_prob[T - 1 - delay : T - 1 - delay + tokens_per_chunk, :]
-            all_logits.append(log_prob)
-        all_logits = torch.concat(all_logits, 0)
+
+            if not first_segment:
+                first_segment_logits = log_prob[0 : T - 1 - delay, :]
+                all_logits.append(first_segment_logits)
+                first_segment = True
+
+            middle_logits = log_prob[T - 1 - delay : T - 1 - delay + tokens_per_chunk, :]
+            all_logits.append(middle_logits)
+
+            # Process the last chunk
+            if log_prob is self.all_logits[-1]:
+                last_segment_logits = log_prob[T - 1 - delay + tokens_per_chunk:, :]
+                all_logits.append(last_segment_logits)
+
+        all_logits = torch.cat(all_logits, dim=0)
         return hypothesis, all_logits
+
+    # def transcribe(self, tokens_per_chunk: int, delay: int, keep_logits: bool = False):
+    #     self.infer_logits(keep_logits)
+    #     self.unmerged = []
+    #     for pred in self.all_preds:
+    #         decoded = pred.tolist()
+    #         self.unmerged += decoded[len(decoded) - 1 - delay : len(decoded) - 1 - delay + tokens_per_chunk]
+    #     hypothesis = self.greedy_merge(self.unmerged)
+    #     if not keep_logits:
+    #         return hypothesis
+
+    #     all_logits = []
+    #     for log_prob in self.all_logits:
+    #         T = log_prob.shape[0]
+    #         log_prob = log_prob[T - 1 - delay : T - 1 - delay + tokens_per_chunk, :]
+    #         all_logits.append(log_prob)
+    #     all_logits = torch.concat(all_logits, 0)
+    #     return hypothesis, all_logits
 
     def greedy_merge(self, preds):
         decoded_prediction = []
