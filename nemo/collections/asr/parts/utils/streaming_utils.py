@@ -640,13 +640,40 @@ class FeatureFrameBufferer:
 
         return batch_frames
 
-    def get_frame_buffers(self, frames, right_delay=0.0):
-        # Ensure right_delay is an integer multiple of frame length
-        if right_delay % self.frame_len != 0:
-            raise ValueError("right_delay must be an integer multiple of frame_len")
+    def get_frame_buffers(self, frames, chunk_delay=1.92):
+        if chunk_delay < 0:
+            raise ValueError("chunk_delay must be greater than or equal to 0")
 
-        # Convert right_delay to feature frames
-        right_delay_frames = int(right_delay / self.asr_model._cfg.preprocessor.window_stride)
+        #tolerance = 1e-6
+        #if abs(chunk_delay % self.frame_len) > tolerance:
+        if (100*chunk_delay) % (100*self.frame_len) != 0:
+            print(self.frame_len)
+            raise ValueError("chunk_delay must be an integer multiple of frame_len")
+
+        # Convert chunk_delay to feature frames
+        chunk_delay_frames = int(chunk_delay / self.asr_model._cfg.preprocessor.window_stride)
+
+        # Print debugging information
+        print(f"chunk_delay: {chunk_delay}")
+        print(f"frame_len: {self.frame_len}")
+        print(f"window_stride: {self.asr_model._cfg.preprocessor.window_stride}")
+        print(f"ZERO_LEVEL_SPEC_DB_VAL: {self.ZERO_LEVEL_SPEC_DB_VAL}")
+
+        # Buffer lengths calculation
+        total_buffer_len = int(8.0 / self.asr_model._cfg.preprocessor.window_stride)
+        chunk_size_frames = int(0.16 / self.asr_model._cfg.preprocessor.window_stride)
+        middle_size = chunk_size_frames  # Fixed size of the middle part
+        left_size = total_buffer_len // 2 - middle_size // 2 + chunk_delay_frames  # Left part size
+        right_size = total_buffer_len // 2 - middle_size // 2 - chunk_delay_frames  # Right part size
+
+        print(f"Buffer sizes -> Total: {total_buffer_len}, Left: {left_size}, Middle: {middle_size}, Right: {right_size}")
+
+        # Initialize buffer if not already done
+        if not hasattr(self, 'buffer'):
+            self.buffer = np.full((80, total_buffer_len), self.ZERO_LEVEL_SPEC_DB_VAL)
+
+        # Initialize right part to zero
+        self.buffer[:, -right_size:] = self.ZERO_LEVEL_SPEC_DB_VAL
 
         # Build buffers for each frame
         self.frame_buffers = []
@@ -658,16 +685,39 @@ class FeatureFrameBufferer:
                 self.frame_buffers.append(np.copy(frame))
                 continue
 
-            if right_delay > 0:
-                self.buffer[:, :-curr_frame_len - right_delay_frames] = self.buffer[:, curr_frame_len:-right_delay_frames]
-                self.buffer[:, -curr_frame_len - right_delay_frames: -right_delay_frames] = frame
-                self.buffer[:, -right_delay_frames:] = self.ZERO_LEVEL_SPEC_DB_VAL
-            else:
-                self.buffer[:, :-curr_frame_len] = self.buffer[:, curr_frame_len:]
-                self.buffer[:, -curr_frame_len:] = frame
+            # Shift left part and append new frame in the middle part
+            self.buffer[:, :-middle_size] = self.buffer[:, middle_size:]
+            self.buffer[:, left_size:left_size + middle_size] = frame
+
+            # Calculate the left, middle, and right parts of the buffer
+            left_part = self.buffer[:, :left_size]
+            middle_part = self.buffer[:, left_size:left_size + middle_size]
+            right_part = self.buffer[:, -right_size:]
+
+            # Ensure that the right part is entirely zeros (if chunk_delay > 0, zero out the corresponding part)
+            if chunk_delay > 0:
+                self.buffer[:, -chunk_delay_frames:] = self.ZERO_LEVEL_SPEC_DB_VAL
+
+            print(f"Left part of the buffer: {left_part}")
+            print(f"Middle part of the buffer: {middle_part}")
+            print(f"Right part of the buffer: {right_part}")
+
+            # Verify that the right side is indeed zero
+            right_side_squared_sum = (right_part ** 2).sum()
+            left_side_squared_sum = (left_part ** 2).sum()
+            middle_side_squared_sum = (middle_part ** 2).sum()
+
+            print(f"Sum of squared values in the right side: {right_side_squared_sum}")
+            print(f"Sum of squared values in the left side: {left_side_squared_sum}")
+            print(f"Sum of squared values in the middle part: {middle_side_squared_sum}")
+
+            print(f"Sizes -> Left: {left_part.shape}, Middle: {middle_part.shape}, Right: {right_part.shape}")
+            print(f"Frame shape: {frame.shape}")
 
             self.frame_buffers.append(np.copy(self.buffer))
+
         return self.frame_buffers
+
 
 '''
     def get_frame_buffers(self, frames):
