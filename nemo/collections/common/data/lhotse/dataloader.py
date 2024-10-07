@@ -41,7 +41,12 @@ from lhotse.utils import fastcopy, fix_random_seed
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset, read_cutset_from_config
-from nemo.collections.common.data.lhotse.text_adapters import NeMoSFTExample, SourceTargetTextExample, TextExample
+from nemo.collections.common.data.lhotse.text_adapters import (
+    NeMoMultimodalConversation,
+    NeMoSFTExample,
+    SourceTargetTextExample,
+    TextExample,
+)
 from nemo.collections.common.prompts.fn import get_prompt_format_fn
 from nemo.collections.common.tokenizers.aggregate_tokenizer import TokenizerWrapper
 from nemo.utils import logging
@@ -730,12 +735,20 @@ def tokenize_with_prompt(example: Example, tokenizer, prompt_format: str) -> Exa
     #   We intend to extend it for text modality in follow-up work.
     if isinstance(example, Cut):
         prompt_format_fn = get_prompt_format_fn(prompt_format)
-        (tokenized_prompted_transcript,), (tokenized_prompt,), (tokenized_transcript,) = prompt_format_fn(
-            CutSet([example]), tokenizer
-        )
-        example.tokenized_prompted_transcript = tokenized_prompted_transcript
-        example.tokenized_prompt = tokenized_prompt
-        example.tokenized_transcript = tokenized_transcript
+        ans = prompt_format_fn(CutSet([example]), tokenizer)
+        if isinstance(ans, tuple):
+            (tokenized_prompted_transcript,), (tokenized_prompt,), (tokenized_transcript,) = ans
+            example.tokenized_prompted_transcript = tokenized_prompted_transcript
+            example.tokenized_prompt = tokenized_prompt
+            example.tokenized_transcript = tokenized_transcript
+        elif isinstance(ans, dict):
+            example.tokenized_prompted_transcript = ans["input_ids"][0]
+            example.tokenized_prompt = ans["context_ids"][0]
+            example.tokenized_transcript = ans["answer_ids"][0]
+        else:
+            raise RuntimeError(f"Unexpected return type from prompt_format_fn (must be dict or tuple): {ans}")
+    elif isinstance(example, NeMoMultimodalConversation):
+        example = example.tokenize(tokenizer, prompt_format)
     else:
         raise RuntimeError(f"Currently we only support tokenization + prompting during sampling for audio modality.")
     return example
