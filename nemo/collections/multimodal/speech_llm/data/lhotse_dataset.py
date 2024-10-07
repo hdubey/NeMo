@@ -36,6 +36,10 @@ from nemo.collections.multimodal.speech_llm.parts.utils.data_utils import (
     ceil_to_nearest,
 )
 
+from lhotse import CutSet
+import random
+import torch
+
 def collate_vectors(items, max_length: int, padding_value):
     vectors = collate_vectors_lhotse(items, padding_value=padding_value)
     if max_length > vectors.size(1):
