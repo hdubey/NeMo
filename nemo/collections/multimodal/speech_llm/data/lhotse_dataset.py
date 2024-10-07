@@ -121,253 +121,59 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         )
         self.t5_style = t5_style
 
-    def __getitem__(self, cuts) -> dict[str, torch.Tensor | list[str] | dict]:
-        cuts = cuts.sort_by_duration()
+def __getitem__(self, cuts: CutSet) -> dict[str, torch.Tensor | list[str] | dict]:
+    ans = {}
 
-        logging.debug(f"Len: {len(cuts)}")
+    # Step 1: Filter and load audio cuts
+    audio_cuts = cuts.filter(lambda c: isinstance(c, Cut))
+    if audio_cuts:
+        # In this case, we expect that each `Cut` in the CutSet contains both the user request audio and the voice assistant response.
+        # We'll extract both audio streams (user request and assistant response).
+        user_request_audio = []
+        assistant_response_audio = []
+        audio_lens = []
 
-        metadata = []
-        instructions, instruction_lengths = [], []
-        source_texts, source_text_lengths = [], []  # Not used in the current implementation
-        target_texts, target_text_lengths = [], []
-        remove_ids = []
-        for id, cut in enumerate(cuts):
-            metadata.append({'audio_filepath': cut.id + '.wav'})
-            # TODO: the following use of _process_example is not ideal. Should update
-            instruction = self.text_processor._process_example(context=cut.supervisions[0].text, output="")
-            instruction, instruction_length = torch.as_tensor(instruction["input_ids"][:-1]), torch.as_tensor(
-                len(instruction["input_ids"]) - 1
-            )
+        # Iterate over each cut and load the user request and assistant response audio
+        for cut in audio_cuts:
+            if hasattr(cut, 'user_request_audio') and hasattr(cut, 'assistant_response_audio'):
+                # Load both audio streams (assuming the cut has attributes for both audio streams)
+                user_request_audio.append(cut.user_request_audio.load_audio())
+                assistant_response_audio.append(cut.assistant_response_audio.load_audio())
+                audio_lens.append(cut.duration)
 
-            source_text = self.text_processor._process_example(context=cut.supervisions[1].text, output="")
-            source_text, source_text_length = torch.as_tensor(source_text["input_ids"]), torch.as_tensor(
-                len(source_text["input_ids"])
-            )
+        # Ensure the lengths of the user request and assistant response are equal (if not, resample or pad).
+        max_length = max(audio_lens)
+        user_request_audio = collate_vectors(user_request_audio, max_length=max_length, padding_value=0.0)
+        assistant_response_audio = collate_vectors(assistant_response_audio, max_length=max_length, padding_value=0.0)
+        audio_lens = torch.FloatTensor(audio_lens)
 
-            target_text = self.text_processor._process_example(context="", output=cut.supervisions[2].text)
-            # -1 to remove the eos token added by the text processor
-            target_text, target_text_length = torch.as_tensor(target_text["answer_ids"][:-1]), torch.as_tensor(
-                len(target_text["answer_ids"]) - 1
-            )
+        # Step 2: Add the audio data to the return batch
+        audio_ratio = [1.0] * len(audio_cuts)
 
-            if self.filter_by_source_target_text_ratio:
-                if (
-                    source_text_length / target_text_length > self.source_target_text_ratio_limit
-                    or target_text_length / source_text_length > self.source_target_text_ratio_limit
-                ):
-                    remove_ids.append(id)
-                    continue
+        metadata = [{'audio_filepath': cut.id + '.wav'} for cut in audio_cuts]
 
-            instructions.append(instruction)
-            instruction_lengths.append(instruction_length)
-            source_texts.append(source_text)
-            source_text_lengths.append(source_text_length)
-            target_texts.append(target_text)
-            target_text_lengths.append(target_text_length)
-
-        cuts = [c for i, c in enumerate(cuts) if i not in remove_ids]
-
-        # audio, audio_lens, cuts = self.load_audio(cuts)
-        # TODO
-        # AudioSamples does not work if the audio files in the CutSet has different sampling rates
-        audio, audio_lens, cuts = zip(*[self.load_audio(CutSet([c])) for c in cuts])
-        # Resample audio waveform here since cuts.resample causes core dump sometimes
-        # cuts_sample_rates = [c.recording.sampling_rate for c in cuts]
-        # import torchaudio
-        # audio = [torchaudio.functional.resample(a, orig_sample_rate, self.sample_rate).squeeze(0) for a, orig_sample_rate in zip(audio, cuts_sample_rates)]
-        # audio_lens = (torch.IntTensor(audio_lens) * (self.sample_rate / torch.IntTensor(cuts_sample_rates))).int()
-        audio = collate_vectors([a.squeeze(0) for a in audio], max_length=max(audio_lens), padding_value=0.0)
-        audio_lens = torch.concat(audio_lens, axis=0)
-        cuts = CutSet([c[0] for c in cuts])
-
-        audio_ratio = []
-        for id, cut in enumerate(cuts):
-            audio_ratio.append(1.0)
-
-        for _, cut in enumerate(cuts):
-            if hasattr(cut, self.context_key):
-                cut.context = getattr(cut, self.context_key)
-            elif hasattr(cut, self.default_context_key):
-                cut.context = getattr(cut, self.default_context_key)
-            else:
-                cut.context = self.default_context
-
-        text_pad_id = self.text_processor.pad_id
-        text_unk_id = self.text_processor.unk_id
-        text_bos_id = self.text_processor.bos_id
-        text_eos_id = self.text_processor.eos_id
-
-        def get_3d_empty_tensor(batch_size, length, text_fill_id, speech_fill_id):
-            return torch.cat(
-                [
-                    torch.full((batch_size, length, 1), text_fill_id),
-                    torch.full(
-                        (batch_size, length, self.n_speech_codebooks * self.decoder_reduction_factor), speech_fill_id
-                    ),
-                ],
-                axis=2,
-            )
-
-        def collate_and_pad(inputs):
-            token_lengths = [len(seq) for seq in inputs]
-            max_length = max(token_lengths)
-            assert len(inputs[0].shape) < 3
-            if len(inputs[0].shape) < 2:
-                if self.pad_to_max_length:
-                    max_length = self.max_seq_length
-                else:
-                    max_length = min(self.max_seq_length, ceil_to_nearest(max_length, 8))
-
-                tokens = collate_vectors(inputs, max_length=max_length, padding_value=text_pad_id)
-            else:
-                tokens = get_3d_empty_tensor(len(inputs), max_length, text_pad_id, self.speech_pad_id)
-                for i in range(len(tokens)):
-                    tokens[i, : token_lengths[i], :] = inputs[i]
-            return tokens, torch.LongTensor(token_lengths)
-
-        features_lens = torch.tensor(
-            [cut.target_codes.shape[0] // self.decoder_reduction_factor for cut in cuts], dtype=torch.int
-        )
-        # +1 for the eos tensor
-        target_codec = get_3d_empty_tensor(len(cuts), max(features_lens).item() + 1, text_pad_id, self.speech_pad_id)
-        eos_tensor = torch.full(
-            (1, self.n_speech_codebooks * self.decoder_reduction_factor + 1), self.speech_eos_id
-        ).to(torch.int)
-        eos_tensor[:, 0] = self.text_processor.unk_id
-        # Loop through cuts and build target_codec
-        for i, cut in enumerate(cuts):
-            feat_i = cut.target_codes.load()
-            target_codec[i, : feat_i.shape[0], 0] = text_unk_id
-            feat_i = feat_i[: features_lens[i] * self.decoder_reduction_factor, : self.n_speech_codebooks]
-            feat_i = feat_i.reshape((-1, self.n_speech_codebooks * self.decoder_reduction_factor))
-            target_codec[i, : feat_i.shape[0], 1:] = torch.tensor(feat_i)
-            target_codec[i, feat_i.shape[0], :] = eos_tensor
-
-        target_codec = target_codec.to(torch.int)
-
-        source_texts, source_text_lengths = collate_and_pad(source_texts)
-
-        def _convert_text_to_3d_tensor(texts, include_eos=True, tokens_to_generate=0):
-            texts, text_lengths = collate_and_pad(texts)
-            texts_expanded = get_3d_empty_tensor(
-                texts.shape[0], texts.shape[1] + 1 + tokens_to_generate, text_pad_id, self.speech_pad_id
-            )
-            for i, text_length in enumerate(text_lengths):
-                texts_expanded[i, :text_length, 0] = texts[i, :text_length]
-                texts_expanded[i, :text_length, 1:] = self.speech_unk_id
-                eos_tensor = torch.full(
-                    (1, self.n_speech_codebooks * self.decoder_reduction_factor + 1), self.speech_bos_id
-                ).to(torch.int)
-                eos_tensor[:, 0] = self.text_processor.eos_id
-
-                texts_expanded[i, text_length, :] = eos_tensor
-            if not include_eos:
-                texts_expanded = texts_expanded[:, :-1]
-            return texts, text_lengths, texts_expanded
-
-        target_texts, target_text_lengths, target_texts_expanded = _convert_text_to_3d_tensor(target_texts)
-        instructions, instruction_lengths, instructions_expanded_no_eos = _convert_text_to_3d_tensor(
-            # tokens_to_generate is used in inference
-            instructions,
-            include_eos=False,
+        # Collate text data as usual
+        collated_text_data = collate_text_data(
+            cuts=audio_cuts,
+            default_context=self.default_context,
+            text_processor=self.text_processor,
             tokens_to_generate=self.tokens_to_generate,
+            pad_to_max_length=self.pad_to_max_length,
+            max_seq_length=self.max_seq_length,
         )
 
-        # answers = torch.concat([speaker_context, bos_tensor, target_codec], 1)
-
-        if getattr(cut, "s2s", False):
-            # Add 1 for eos token
-            token_list = [
-                torch.concat([tt[: ttl + 1], tc[: tcl + 1]], 0)
-                for tt, ttl, tc, tcl in zip(target_texts_expanded, target_text_lengths, target_codec, features_lens)
-            ]
-            if not self.t5_style:
-                token_list = [
-                    torch.concat([it[:itl], tt], 0)
-                    for tt, it, itl in zip(token_list, instructions_expanded_no_eos, instruction_lengths)
-                ]
-            tokens, _ = collate_and_pad(token_list)
-
-            # speech_loss_mask = torch.logical_and((tokens[:, :, 1:] != self.speech_unk_id), (tokens[:, :, 1:] != self.speech_pad_id))
-            # text_loss_mask = torch.logical_and((tokens[:, :, 0:1] != text_unk_id), (tokens[:, :, 0:1] != text_pad_id))
-            speech_loss_mask = tokens[:, :, 1:] != self.speech_pad_id
-            text_loss_mask = tokens[:, :, 0:1] != text_pad_id
-            if not self.t5_style:
-                for itl in instruction_lengths:
-                    speech_loss_mask[:, :itl, :] = False
-                    text_loss_mask[:, :itl, :] = False
-            loss_mask = torch.cat([text_loss_mask, speech_loss_mask], 2)
-            full_lengths = target_text_lengths + 1 + features_lens + 1 + instruction_length
-
-        elif getattr(cut, "direct_s2s", False):
-            # Add 1 for eos token
-            # tt[0] is the bos token
-            token_list = [
-                torch.concat([tt[:1], tc[: tcl + 1]], 0)
-                for tt, tc, tcl in zip(target_texts_expanded, target_codec, features_lens)
-            ]
-            if not self.t5_style:
-                token_list = [
-                    torch.concat([it[:itl], tt], 0)
-                    for tt, it, itl in zip(token_list, instructions_expanded_no_eos, instruction_lengths)
-                ]
-            tokens, _ = collate_and_pad(token_list)
-
-            speech_loss_mask = tokens[:, :, 1:] != self.speech_pad_id
-            text_loss_mask = tokens[:, :, 0:1] != text_pad_id
-            if not self.t5_style:
-                for itl in instruction_lengths:
-                    speech_loss_mask[:, :itl, :] = False
-                    text_loss_mask[:, :itl, :] = False
-            loss_mask = torch.cat([text_loss_mask, speech_loss_mask], 2)
-            full_lengths = 1 + features_lens + 1 + instruction_length
-        elif getattr(cut, "s2t", False):
-            # Add 1 for eos token
-            token_list = [tt[: ttl + 1] for tt, ttl in zip(target_texts_expanded, target_text_lengths)]
-            if not self.t5_style:
-                token_list = [
-                    torch.concat([it[:itl], tt], 0)
-                    for tt, it, itl in zip(token_list, instructions_expanded_no_eos, instruction_lengths)
-                ]
-            tokens, _ = collate_and_pad(token_list)
-
-            speech_loss_mask = torch.zeros(tokens.shape[0], tokens.shape[1] - 1, tokens.shape[2])
-            text_loss_mask = tokens[:, :, 0:1] != text_pad_id
-            if not self.t5_style:
-                for itl in instruction_lengths:
-                    speech_loss_mask[:, :itl, :] = False
-                    text_loss_mask[:, :itl, :] = False
-            loss_mask = torch.cat([text_loss_mask, speech_loss_mask], 2)
-            full_lengths = target_text_lengths + 1 + instruction_length
-        full_lengths = torch.clamp(full_lengths, max=tokens.shape[1])
-        # simplify above code
-        # Start from index 1 since the first token will not be used as a label
-        loss_mask = loss_mask[:, 1:, :]
-
-        # Merge batch
-        # note: the codec id in labels and contexts and others do not consider the offset e.g. speech_eos is 1002
-        # the offset is all considered by SumVocabParallelEmbedding
-        return_batch = {
-            "sample_ids": list(cuts.ids),
-            "audio_signal": audio,
+        # Step 3: Build the return batch with two separate audio streams and text data
+        ans.update({
+            "sample_ids": list(audio_cuts.ids),
+            "user_request_audio": user_request_audio,  # First stream: User request
+            "assistant_response_audio": assistant_response_audio,  # Second stream: Assistant response
             "audio_signal_length": audio_lens,
             "audio_ratio": torch.FloatTensor(audio_ratio),
             "metadata": metadata,
-            # For forward
-            "instructions": instructions,
-            "contexts": instructions_expanded_no_eos,  # used in inference
-            "context_lengths": instruction_lengths,
-            "tokens": tokens[:, :-1, :],
-            "tokens_length": full_lengths - 1,
-            "labels": tokens[:, 1:, :],
-            "loss_mask": loss_mask,
-            # For validation mainly
-            "source_texts": source_texts,
-            "target_texts": target_texts,
-            "target_text_lengths": target_text_lengths,
-            "answers": tokens[:, 1:, :],
-        }
+            **collated_text_data,
+        })
 
+    return ans
         return return_batch
 
 
