@@ -34,23 +34,7 @@ def collate_vectors(items, max_length: int, padding_value):
 # TODO: the changes in this file needed to be moved out as a derived class
 class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
     """
-    This dataset is based on Lhotse ASR dataset from ``audio_to_text_lhotse.py``
-    and ``TarredAudioQuestionAnswerDataset`` from ``audio_text_qa_dataset.py``.
-
-    Unlike native NeMo datasets, Lhotse dataset defines only the mapping from
-    a CutSet (meta-data) to a mini-batch with PyTorch tensors.
-    Specifically, it performs tokenization, I/O, augmentation, and feature extraction (if any).
-    Managing data, sampling, de-duplication across workers/nodes etc. is all handled
-    by Lhotse samplers instead.
-
-    Args:
-        text_processor: TextProcessing object
-        default_context: Default question to use if no question is provided
-        tokens_to_generate: Number of tokens to generate during inference
-        pad_to_max_length: Whether to pad the input to the max sequence length. If False, will pad to the max length of the current batch.
-        max_seq_length: Maximum sequence length for each dataset examples. Examples will either be truncated to fit this length or dropped if they cannot be truncated.
-        context_key: Key to use for the context in your JSONL file
-        default_context_key: Key to use for the default context in lhotse yaml
+    This dataset now handles two parallel audio streams (user query and assistant response).
     """
 
     def __init__(
@@ -97,50 +81,51 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         self.source_target_text_ratio_limit = source_target_text_ratio_limit
         self.sample_rate = sample_rate
 
-        # To be consistent with SALM text processor
-        self.text_processor.add_sep = False
-        self.text_processor.max_seq_length = (
-            4096  # Set this to a large number for since the speech sequence can be long
-        )
-        self.t5_style = t5_style
-
-    def __getitem__(self, cuts) -> dict[str, torch.Tensor | list[str] | dict]:
+    def __getitem__(self, cuts: CutSet) -> dict[str, torch.Tensor | list[str] | dict]:
+        """
+        Modify __getitem__ to handle pairs of audio: user query and assistant response.
+        """
         cuts = cuts.sort_by_duration()
 
         logging.debug(f"Len: {len(cuts)}")
 
         metadata = []
         instructions, instruction_lengths = [], []
-        source_texts, source_text_lengths = [], []  # Not used in the current implementation
+        source_texts, source_text_lengths = [], []
         target_texts, target_text_lengths = [], []
+        user_query_audio, assistant_response_audio = [], []
+        audio_lens = []
         remove_ids = []
+
         for id, cut in enumerate(cuts):
             metadata.append({'audio_filepath': cut.id + '.wav'})
-            # TODO: the following use of _process_example is not ideal. Should update
+            
+            # Assume `cut` has two audio fields: `user_query_audio` and `assistant_response_audio`.
+            if hasattr(cut, 'user_query_audio') and hasattr(cut, 'assistant_response_audio'):
+                user_query = cut.user_query_audio.load_audio()
+                assistant_response = cut.assistant_response_audio.load_audio()
+
+                # Track audio lengths for padding purposes
+                user_query_audio.append(user_query)
+                assistant_response_audio.append(assistant_response)
+                audio_lens.append(cut.duration)
+
+            # Process text inputs, keeping them same as before
             instruction = self.text_processor._process_example(context=cut.supervisions[0].text, output="")
             instruction, instruction_length = torch.as_tensor(instruction["input_ids"][:-1]), torch.as_tensor(
                 len(instruction["input_ids"]) - 1
             )
-
+            
             source_text = self.text_processor._process_example(context=cut.supervisions[1].text, output="")
             source_text, source_text_length = torch.as_tensor(source_text["input_ids"]), torch.as_tensor(
                 len(source_text["input_ids"])
             )
-
+            
             target_text = self.text_processor._process_example(context="", output=cut.supervisions[2].text)
-            # -1 to remove the eos token added by the text processor
             target_text, target_text_length = torch.as_tensor(target_text["answer_ids"][:-1]), torch.as_tensor(
                 len(target_text["answer_ids"]) - 1
             )
-
-            if self.filter_by_source_target_text_ratio:
-                if (
-                    source_text_length / target_text_length > self.source_target_text_ratio_limit
-                    or target_text_length / source_text_length > self.source_target_text_ratio_limit
-                ):
-                    remove_ids.append(id)
-                    continue
-
+            
             instructions.append(instruction)
             instruction_lengths.append(instruction_length)
             source_texts.append(source_text)
@@ -148,65 +133,49 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             target_texts.append(target_text)
             target_text_lengths.append(target_text_length)
 
+        # Filter out any invalid cuts
         cuts = [c for i, c in enumerate(cuts) if i not in remove_ids]
 
-        # audio, audio_lens, cuts = self.load_audio(cuts)
-        # TODO
-        # AudioSamples does not work if the audio files in the CutSet has different sampling rates
-        audio, audio_lens, cuts = zip(*[self.load_audio(CutSet([c])) for c in cuts])
-        # Resample audio waveform here since cuts.resample causes core dump sometimes
-        # cuts_sample_rates = [c.recording.sampling_rate for c in cuts]
-        # import torchaudio
-        # audio = [torchaudio.functional.resample(a, orig_sample_rate, self.sample_rate).squeeze(0) for a, orig_sample_rate in zip(audio, cuts_sample_rates)]
-        # audio_lens = (torch.IntTensor(audio_lens) * (self.sample_rate / torch.IntTensor(cuts_sample_rates))).int()
-        audio = collate_vectors([a.squeeze(0) for a in audio], max_length=max(audio_lens), padding_value=0.0)
-        audio_lens = torch.concat(audio_lens, axis=0)
-        cuts = CutSet([c[0] for c in cuts])
+        # Pad and collate audio
+        max_length = max(audio_lens)
+        user_query_audio = collate_vectors(user_query_audio, max_length=max_length, padding_value=0.0)
+        assistant_response_audio = collate_vectors(assistant_response_audio, max_length=max_length, padding_value=0.0)
+        audio_lens = torch.FloatTensor(audio_lens)
 
-        audio_ratio = []
-        for id, cut in enumerate(cuts):
-            audio_ratio.append(1.0)
+        audio_ratio = [1.0] * len(cuts)
 
-        for _, cut in enumerate(cuts):
-            if hasattr(cut, self.context_key):
-                cut.context = getattr(cut, self.context_key)
-            elif hasattr(cut, self.default_context_key):
-                cut.context = getattr(cut, self.default_context_key)
-            else:
-                cut.context = self.default_context
+        # Collate text data as usual
+        source_texts, source_text_lengths = self.collate_and_pad(source_texts)
+        target_texts, target_text_lengths = self.collate_and_pad(target_texts)
 
-        text_pad_id = self.text_processor.pad_id
-        text_unk_id = self.text_processor.unk_id
-        text_bos_id = self.text_processor.bos_id
-        text_eos_id = self.text_processor.eos_id
+        # Create the return batch
+        return_batch = {
+            "sample_ids": list(cuts.ids),
+            "user_query_audio": user_query_audio,  # First audio stream: User query
+            "assistant_response_audio": assistant_response_audio,  # Second audio stream: Assistant response
+            "audio_signal_length": audio_lens,
+            "audio_ratio": torch.FloatTensor(audio_ratio),
+            "metadata": metadata,
+            "source_texts": source_texts,
+            "target_texts": target_texts,
+            "source_text_lengths": source_text_lengths,
+            "target_text_lengths": target_text_lengths,
+            "instructions": instructions,
+            "instruction_lengths": instruction_lengths,
+        }
 
-        def get_3d_empty_tensor(batch_size, length, text_fill_id, speech_fill_id):
-            return torch.cat(
-                [
-                    torch.full((batch_size, length, 1), text_fill_id),
-                    torch.full(
-                        (batch_size, length, self.n_speech_codebooks * self.decoder_reduction_factor), speech_fill_id
-                    ),
-                ],
-                axis=2,
-            )
+        return return_batch
 
-        def collate_and_pad(inputs):
-            token_lengths = [len(seq) for seq in inputs]
-            max_length = max(token_lengths)
-            assert len(inputs[0].shape) < 3
-            if len(inputs[0].shape) < 2:
-                if self.pad_to_max_length:
-                    max_length = self.max_seq_length
-                else:
-                    max_length = min(self.max_seq_length, ceil_to_nearest(max_length, 8))
-
-                tokens = collate_vectors(inputs, max_length=max_length, padding_value=text_pad_id)
-            else:
-                tokens = get_3d_empty_tensor(len(inputs), max_length, text_pad_id, self.speech_pad_id)
-                for i in range(len(tokens)):
-                    tokens[i, : token_lengths[i], :] = inputs[i]
-            return tokens, torch.LongTensor(token_lengths)
+    def collate_and_pad(self, inputs):
+        """
+        Helper function to collate and pad text sequences.
+        """
+        token_lengths = [len(seq) for seq in inputs]
+        max_length = max(token_lengths)
+        if self.pad_to_max_length:
+            max_length = self.max_seq_length
+        tokens = collate_vectors(inputs, max_length=max_length, padding_value=self.text_processor.pad_id)
+        return tokens, torch.LongTensor(token_lengths)
 
         features_lens = torch.tensor(
             [cut.target_codes.shape[0] // self.decoder_reduction_factor for cut in cuts], dtype=torch.int
