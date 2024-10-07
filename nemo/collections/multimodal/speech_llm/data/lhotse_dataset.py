@@ -2,9 +2,8 @@ import logging
 import random
 
 import torch.utils.data
-from lhotse.cut import Cut, CutSet, MixedCut
+from lhotse import Cut, CutSet, MixedCut
 from lhotse.dataset import AudioSamples
-from lhotse.dataset.collation import _read_features
 from lhotse.dataset.collation import collate_vectors as collate_vectors_lhotse
 
 from nemo.collections.common.data.lhotse.text_adapters import (
@@ -19,26 +18,6 @@ from nemo.collections.multimodal.speech_llm.parts.utils.data_utils import (
     build_loss_mask,
     ceil_to_nearest,
 )
-from nemo.utils import logging
-
-import logging
-import random
-
-import torch.utils.data
-from lhotse import CutSet
-from lhotse.dataset import AudioSamples
-from lhotse.dataset.collation import _read_features
-from lhotse.dataset.collation import collate_vectors as collate_vectors_lhotse
-
-from nemo.collections.multimodal.speech_llm.parts.utils.data_utils import (
-    TextProcessing,
-    build_loss_mask,
-    ceil_to_nearest,
-)
-
-from lhotse import CutSet
-import random
-import torch
 
 def collate_vectors(items, max_length: int, padding_value):
     vectors = collate_vectors_lhotse(items, padding_value=padding_value)
