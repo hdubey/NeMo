@@ -23,6 +23,7 @@ from megatron.core.parallel_state import get_data_parallel_group
 from torch import nn
 from typing_extensions import Self, override
 
+from nemo.lightning.ckpt_utils import ckpt_to_dir
 from nemo.lightning.io.capture import IOProtocol
 from nemo.lightning.io.mixin import IOMixin
 
@@ -126,13 +127,22 @@ class MegatronCheckpointIO(AsyncCompatibleCheckpointIO, IOMixin):
 
         validate_sharding_integrity = not (self.validated_consistency and self.assume_constant_structure)
         self.validated_consistency = True
-        return dist_checkpointing.save(
-            sharded_state_dict=checkpoint,
-            checkpoint_dir=checkpoint_dir,
-            sharded_strategy=self.save_sharded_strategy,
-            validate_access_integrity=validate_sharding_integrity,
-            async_sharded_save=self.async_save,
-        )
+
+        try:
+            return dist_checkpointing.save(
+                sharded_state_dict=checkpoint,
+                checkpoint_dir=checkpoint_dir,
+                sharded_strategy=self.save_sharded_strategy,
+                validate_access_integrity=validate_sharding_integrity,
+                async_sharded_save=self.async_save,
+            )
+        except:
+            logging.error(f"Failed to save checkpoint to {checkpoint_dir}")
+            # Do cleanup.
+            import shutil
+
+            shutil.rmtree(checkpoint_dir)
+            raise
 
     @override
     def load_checkpoint(
@@ -208,6 +218,13 @@ class MegatronCheckpointIO(AsyncCompatibleCheckpointIO, IOMixin):
         are passed in config or in case of a fully parallel save in which case
         a parallelization wrapper is applied.
         """
+        if self.save_ckpt_format == 'zarr':
+            logging.warning(
+                f'`zarr` distributed checkpoint backend is deprecated.'
+                f' Distributed optimizer checkpoint saving might be extremely slow.'
+                f' Please switch to PyTorch Distributed format (model.dist_ckpt_format=torch_dist).'
+            )
+
         if self.async_save and self.save_ckpt_format != 'torch_dist':
             raise ValueError('Async dist-ckpt save supported only for torch_dist format')
 
@@ -251,24 +268,6 @@ def _fix_tensors_device(ckpt: Dict) -> Dict:
         return t
 
     return dict_list_map_outplace(_fix_device, ckpt)
-
-
-def ckpt_to_dir(filepath: Union[str, Path]) -> Path:
-    """PTL considers checkpoints as .ckpt files.
-    This method removes the extension and returns a path
-    to be used as a directory for distributed checkpoints.
-    """
-    filepath = Path(filepath)
-    if not filepath.suffix == ".ckpt":
-        filepath = filepath.with_suffix(filepath.suffix + ".ckpt")
-
-    # adding this assert because we will later remove directories based on the return value of this method
-    assert filepath.suffix == ".ckpt", f"filepath: {filepath} must have .ckpt extension"
-
-    # create a new path whose name is the original filepath without the .ckpt extension
-    checkpoint_dir = filepath.with_name(filepath.stem)
-
-    return checkpoint_dir
 
 
 def is_distributed_ckpt(path) -> bool:

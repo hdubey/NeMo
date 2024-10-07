@@ -1,3 +1,17 @@
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from unittest.mock import ANY, MagicMock, patch
 
 import torch
@@ -51,6 +65,8 @@ def test_init_parallel_ranks(mock_initialize_model_parallel) -> None:
 
     app_state.tensor_model_parallel_size = 2
     app_state.pipeline_model_parallel_size = 3
+    app_state.context_parallel_size = 2
+    app_state.expert_model_parallel_size = 2
     app_state.global_rank = 1
     app_state.local_rank = 0
 
@@ -58,7 +74,9 @@ def test_init_parallel_ranks(mock_initialize_model_parallel) -> None:
     mock_parallel_config.tensor_model_parallel_size = 2
     mock_parallel_config.pipeline_model_parallel_size = 3
     mock_parallel_config.virtual_pipeline_model_parallel_size = 4
-    mock_parallel_config.ub_tp_comm_overlap = False
+    mock_parallel_config.context_parallel_size = 2
+    mock_parallel_config.expert_model_parallel_size = 2
+    mock_parallel_config.tp_comm_overlap = False
     mock_parallel_config.pipeline_model_parallel_split_rank = None
 
     _strategy_lib.init_parallel_ranks(
@@ -76,6 +94,8 @@ def test_init_parallel_ranks(mock_initialize_model_parallel) -> None:
         tensor_model_parallel_size=2,
         pipeline_model_parallel_size=3,
         virtual_pipeline_model_parallel_size=4,
+        context_parallel_size=2,
+        expert_model_parallel_size=2,
         seed=1234,
         pipeline_model_parallel_split_rank=None,
         use_fp8=False,
@@ -93,6 +113,8 @@ def test_init_model_parallel(mock_mpu, *args):
     app_state.tensor_model_parallel_size = 2
     app_state.pipeline_model_parallel_size = 1
     app_state.pipeline_model_parallel_split_rank = None
+    app_state.context_parallel_size = 2
+    app_state.expert_model_parallel_size = 2
     app_state.init_mpi_proc_group = False
     app_state.tensor_model_parallel_rank = 2
     app_state.pipeline_model_parallel_rank = 0
@@ -105,6 +127,8 @@ def test_init_model_parallel(mock_mpu, *args):
         pipeline_model_parallel_size=1,
         virtual_pipeline_model_parallel_size=None,
         pipeline_model_parallel_split_rank=None,
+        context_parallel_size=2,
+        expert_model_parallel_size=2,
     )
 
 
