@@ -1,95 +1,124 @@
-# EarTTS config for S2S-ST — LLM backbone: nvidia/Riva-Translate-4B-Instruct-v1.1
-# Branch: voicetranslate-v1/eartts_inter
-# Repo:   github.com/hdubey/private-nv-NeMo-s2s
-# Based on: duplex_eartts_s2s_st_hdubey.yaml (Qwen2.5-1.5B version)
-# Updated: 2026-04-16
+# VoiceTranslate-v1 — EarTTS integration on top of Riva-Translate-4B-Instruct S2S pipeline
+# Branch:  voicetranslate-v1/eartts_inter
+# Repo:    github.com/hdubey/private-nv-NeMo-s2s (private)
+# Created: 2026-04-16
 #
-# KEY DIFFERENCES FROM QWEN CONFIG:
-#   - pretrained_lm_name: nvidia/Riva-Translate-4B-Instruct-v1.1 (replaces Qwen2.5-1.5B)
-#   - context_hidden_size: 3072  (Riva-4B hidden dim; was null for Qwen)
-#   - lr: 1e-4 (matches Riva-4B S2S-ST practice; Qwen used 4e-5)
-#   - warmup_steps: 4000 (was 2500)
-#   - exp_manager names updated to riva4b
+# ARCHITECTURE:
+#   Source speech (FR/ES/DE)
+#     ↓ [OLD — from Nourchene's Riva-4B config, unchanged]
+#   FastConformer encoder  (perception block, att_context_size=[70,0])
+#     ↓
+#   Riva-Translate-4B-Instruct-v1.1  (LLM, unfrozen)
+#     ↓ [NEW — EarTTS replaces TransformerARSpeechDecoder + NanoCodec]
+#   RVQEARTTSModel  (tts_config block below)
+#     ↓
+#   RVQVAEModel codec  (codec_config block below)
+#     ↓
+#   English speech output
+#
+# WHAT CHANGED vs Nourchene's Riva-4B config:
+#   REPLACED: model.speech_decoder  → model.tts_config  (EarTTS backbone)
+#   REPLACED: model.pretrained_audio_codec (NanoCodec .nemo)
+#           → model.pretrained_codec_model (RVQVAEModel .ckpt) — TODO: get from Edresson
+#   ADDED:    model.codec_config  (RVQVAEModel architecture)
+#   ADDED:    model.pretrained_tts_model  (EarTTS TTS ckpt) — TODO: get from Edresson
+#   KEPT:     everything else (perception, pretrained_llm, pretrained_asr, optimizer,
+#             trainer, data) identical to Nourchene's config
 #
 # TODO (before first run):
-#   [ ] Set model.pretrained_codec_model to Edresson's RVQVAEModel checkpoint
-#   [ ] Set model.pretrained_tts_model to Edresson's EarTTS TTS checkpoint
-#   [ ] Verify DuplexEARTTSDataset is compatible with S2S-ST lhotse manifests
-#   [ ] Confirm codec_config matches the pretrained codec checkpoint architecture
+#   [ ] model.pretrained_codec_model — Edresson's RVQVAEModel checkpoint
+#   [ ] model.pretrained_tts_model   — Edresson's EarTTS pretrained TTS checkpoint
+#   [ ] New model class needed: DuplexS2SSpeechDecoderModel2 currently uses
+#       TransformerARSpeechDecoder; a new class (or modified version) must route
+#       LLM output → RVQEARTTSModel instead. See TRAINING_PLANS.md.
 
 model:
-  # ------- LM backbone: Riva-Translate-4B-Instruct-v1.1 -------
-  pretrained_lm_name: "/lustre/fsw/portfolios/edgeai/users/amhussein/cache/HFCACHE/hub/models--nvidia--Riva-Translate-4B-Instruct-v1.1/snapshots/f859e48c4c82696c5929cd06590f600a41dc7f3c"
+  # ===== OLD: from Nourchene's Riva-4B config — DO NOT CHANGE =====
 
-  # ------- Codec (RVQVAEModel — NOT NanoCodec) -------
-  # pretrained_codec_model: /path/to/edresson_rvqvae_codec.ckpt  # TODO: obtain from Edresson
+  pretrained_llm: nvidia/Riva-Translate-4B-Instruct-v1.1
+
+  # NEW codec replaces NanoCodec — set path when Edresson's checkpoint is available:
+  # pretrained_codec_model: /path/to/edresson_rvqvae_codec.ckpt
   pretrained_codec_model: null
+  # OLD NanoCodec line (kept for reference, not used with EarTTS):
+  # pretrained_audio_codec: /lustre/fsw/portfolios/convai/users/ecasanova/Checkpoints/...
 
-  # ------- TTS model checkpoint (EarTTS pretrained weights) -------
-  # pretrained_tts_model: /path/to/edresson_eartts_tts.ckpt  # TODO: obtain from Edresson
+  pretrained_asr: /lustre/fsw/portfolios/edgeai/users/amhussein/pretrained_models/asr/mml-en-fr-es-de/en-fr-es-de.nemo
+  scoring_asr: stt_en_fastconformer_transducer_large
+
+  pretrained_weights: true
+  audio_loss_weight: 4
+  text_loss_weight: 3
+
+  # NEW TTS checkpoint (Edresson's pretrained EarTTS weights):
+  # pretrained_tts_model: /path/to/edresson_eartts_tts.ckpt
   pretrained_tts_model: null
 
-  # ------- Tokenizer special tokens (null → use Riva-4B tokenizer defaults) -------
-  bos_token: null
-  eos_token: null
-  pad_token: null
+  freeze_params:
+    - "^audio_codec\\..+$"                           # codec frozen (RVQVAEModel)
+    - "^speech_generation\\.speaker_encoder\\..+$"   # speaker encoder frozen
+  prevent_freeze_params: []
 
-  # ------- Codec precision -------
+  duplex_user_channel_weight: 1.0
+  hidden_pooling_factor: 2
+
+  audio_save_path: ${exp_manager.explicit_log_dir}/pred_audios
+
   audio_codec_run_dtype: float32
-
-  # ------- Loss scaling -------
   scale_loss_by: non_sil_t
   scale_loss_mask: 10
 
-  # ------- Inference params -------
-  scoring_asr: stt_en_fastconformer_transducer_large
-  inference_guidance_scale: 0.5
-  inference_noise_scale: 0.8
-  inference_top_p_or_k: 0.8
-  inference_guidance_enabled: true
+  # ===== OLD: FastConformer audio encoder — DO NOT CHANGE =====
+  perception:
+    target: nemo.collections.multimodal.speech_llm.modules.perception_modules.AudioPerceptionModule
+    use_multi_layer_feat: false
+    add_sep: true
+    is_canary: true
+    preprocessor:
+      normalize: 'NA'
 
-  # ------- Parameter freezing -------
-  freeze_params:
-    - "^audio_codec\\..+$"      # codec always frozen
-    - "^embed_tokens\\..+$"     # keep embed_tokens frozen
-  prevent_freeze_params: []
+    encoder:
+      self_attention_model: 'rel_pos'
+      att_context_size: [70, 0]
+      conv_context_size: causal
+      conv_norm_type: layer_norm
 
-  # ------- Optimizer (lr matched to Riva-4B S2S-ST practice) -------
-  optimizer:
-    _target_: torch.optim.AdamW
-    lr: 1e-4
-    betas: [0.9, 0.98]
-    weight_decay: 0.01
-    foreach: true
+    modality_adapter:
+      _target_: nemo.collections.asr.modules.ConformerEncoder
+      feat_in: 512
+      feat_out: -1
+      n_layers: 2
+      d_model: 512
+      subsampling: dw_striding
+      subsampling_factor: 1
+      subsampling_conv_channels: 256
+      causal_downsampling: true
+      ff_expansion_factor: 4
+      self_attention_model: rel_pos
+      n_heads: 8
+      att_context_size: [70, 0]
+      att_context_style: chunked_limited
+      xscaling: true
+      untie_biases: true
+      pos_emb_max_len: 5000
+      conv_kernel_size: 9
+      conv_norm_type: layer_norm
+      conv_context_size: causal
+      dropout: 0
+      dropout_pre_encoder: 0
+      dropout_emb: 0.0
+      dropout_att: 0
 
-  lr_scheduler:
-    _target_: nemo.core.optim.lr_scheduler.InverseSquareRootAnnealing
-    warmup_steps: 4000
-    min_lr: 1e-6
-    max_steps: ${trainer.max_steps}
+    spec_augment:
+      _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+      freq_masks: 2
+      time_masks: 10
+      freq_width: 27
+      time_width: 0.05
 
-  # ------- RVQVAEModel codec architecture -------
-  codec_config:
-    latent_size: 512
-    n_fft: 16
-    hop_length: 4
-    base_hidden_size: 384
-    channel_mult:
-      - 1
-      - 2
-      - 4
-    rates:
-      - 7
-      - 7
-      - 9
-    num_blocks: 3
-    kernel_size: 7
-    groups: 1
-    codebook_size: 1024
-    num_quantizers: 31
-    wav_to_token_ratio: 1764   # 22050 Hz / 12.5 FPS = 1764 samples/frame
-
-  # ------- EarTTS TTS architecture (RVQEARTTSModel) -------
+  # ===== NEW: EarTTS TTS backbone — replaces speech_decoder =====
+  # OLD speech_decoder (TransformerARSpeechDecoder) is removed.
+  # RVQEARTTSModel is wired in via tts_config below.
   tts_config:
     use_gated_fusion_for_text_audio: true
     disable_eos_prediction: true
@@ -111,22 +140,20 @@ model:
     latent_size: 512
     codebook_size: 1024
     num_quantizers: 31
-    context_hidden_size: 3072   # Riva-Translate-4B-Instruct hidden dim (mistral, 34 layers)
+    context_hidden_size: 3072   # Riva-Translate-4B-Instruct hidden dim (mistral, 34L)
     cas_config:
-      backbone_type: t5gemma
-      backbone_model_class: null
-      backbone_config_class: null
+      backbone_type: null         # t5gemma in container; set null + model/config_class for conda
+      backbone_model_class: BertModel
+      backbone_config_class: BertConfig
       backbone_config:
-        is_encoder_decoder: false
-        encoder:
-          hidden_size: 1152
-          intermediate_size: 4608
-          num_hidden_layers: 1
-          num_attention_heads: 16
-          num_key_value_heads: 16
-          head_dim: 72
-          use_cache: false
-          attention_dropout: 0.1
+        hidden_size: 1152
+        num_hidden_layers: 1
+        num_attention_heads: 16
+        intermediate_size: 4608
+        hidden_dropout_prob: 0.1
+        attention_probs_dropout_prob: 0.1
+        max_position_embeddings: 512
+        vocab_size: 131072
     mog_head_config:
       intermediate_size: 4608
       num_layers: 3
@@ -141,6 +168,36 @@ model:
     random_target_masking: false
     exponent: 3.0
 
+  # ===== NEW: RVQVAEModel codec architecture — replaces NanoCodec =====
+  codec_config:
+    latent_size: 512
+    n_fft: 16
+    hop_length: 4
+    base_hidden_size: 384
+    channel_mult: [1, 2, 4]
+    rates: [7, 7, 9]
+    num_blocks: 3
+    kernel_size: 7
+    groups: 1
+    codebook_size: 1024
+    num_quantizers: 31
+    wav_to_token_ratio: 1764   # 22050 Hz / 12.5 FPS
+
+  # ===== OLD: Optimizer — identical to Nourchene's Riva-4B config =====
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4
+    betas: [0.9, 0.98]
+    weight_decay: 0
+    foreach: true
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.InverseSquareRootAnnealing
+    warmup_steps: 4000
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+# ===== OLD: Trainer — identical to Nourchene's Riva-4B config =====
 trainer:
   devices: -1
   accelerator: gpu
@@ -152,7 +209,7 @@ trainer:
   max_steps: 100000
   val_check_interval: 1000
   limit_train_batches: ${trainer.val_check_interval}
-  limit_val_batches: 1
+  limit_val_batches: 2
   log_every_n_steps: 20
   num_sanity_val_steps: 0
   gradient_clip_val: 1.0
@@ -162,16 +219,16 @@ trainer:
     gradient_as_bucket_view: true
     find_unused_parameters: true
 
+# ===== OLD: Data — identical to Nourchene's Riva-4B config =====
 data:
-  add_text_bos_and_eos_in_each_turn: true
-  add_audio_prompt: true
-  add_audio_prompt_after_description: true
-  audio_prompt_duration: 3.0
-  frame_length: 0.08                   # 80ms → 12.5 FPS
-  source_sample_rate: 22050
-  target_sample_rate: 22050
+  frame_length: 0.08
+  source_sample_rate: 16000      # FastConformer encodes at 16kHz
+  target_sample_rate: 22050      # RVQVAEModel outputs at 22050Hz
   input_roles: ["user", "User"]
   output_roles: ["agent", "Assistant", "assistant", "Agent"]
+  add_delay_token: false
+  add_audio_prompt: true
+  audio_prompt_duration: 3.0
 
   train_ds:
     sample_rate: ${data.target_sample_rate}
@@ -181,8 +238,8 @@ data:
     seed: 42
     shard_seed: "trng"
     sampler_weights:
-      riva_es: 1.0
-    riva_es:
+      riva_mult: 1.0
+    riva_mult:
       input_cfg: /lustre/fsw/portfolios/edgeai/users/amhussein/s2s/configs/data/riva_multiling_st_concat_v_mfa_target_aligned.yaml
       bucket_buffer_size: 10000
       shuffle_buffer_size: 10000
@@ -193,8 +250,9 @@ data:
       num_buckets: 30
       bucket_duration_bins: [5.33,6.27,6.96,7.54,8.07,8.55,8.99,9.39,9.76,10.14,10.54,10.99,11.49,12.04,12.64,13.28,13.96,14.69,15.48,16.32,17.25,18.28,19.39,20.65,22.14,24.01,26.34,29.21,32.79]
       batch_duration: 400
+      batch_size: 4
       use_bucketing: true
-      seed: "trng"
+      seed: 'trng'
 
   validation_ds:
     datasets:
@@ -205,14 +263,15 @@ data:
       cvss-DeTest:
         shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test
     sample_rate: ${data.target_sample_rate}
-    batch_size: 1
+    batch_size: 4
     seed: 42
     shard_seed: "randomized"
 
+# ===== hdubey's experiment paths =====
 exp_manager:
   exp_dir: null
   explicit_log_dir: /lustre/fsw/portfolios/edgeai/users/hdubey/s2s_exp/eartts/riva4b_run1
-  name: eartts_s2s_st_riva4b
+  name: eartts_s2s_st_riva4b_voicetranslate_v1
   create_tensorboard_logger: false
   create_checkpoint_callback: true
   use_datetime_version: false
@@ -224,7 +283,7 @@ exp_manager:
 
   create_wandb_logger: true
   wandb_logger_kwargs:
-    name: eartts_s2s_st_riva4b
+    name: eartts_s2s_st_riva4b_voicetranslate_v1
     project: duplex_s2s_st_eartts
     entity: riva-nemo-llm-mlops
     resume: true
