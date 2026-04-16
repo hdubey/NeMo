@@ -11,20 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .datamodule import DataModule
-from .duplex_ear_tts_dataset import DuplexEARTTSDataset
-from .duplex_stt_dataset import DuplexSTTDataset
-from .s2s_dataset import DuplexS2SDataset
-from .s2s_dataset_concat_v import DuplexS2SDatasetConcatV
-from .s2s_dataset_concat_v_codec import DuplexS2SDatasetConcatVCodec
-from .salm_dataset import SALMDataset
 
-__all__ = [
-    'DataModule',
-    'DuplexEARTTSDataset',
-    'DuplexSTTDataset',
-    'DuplexS2SDataset',
-    'DuplexS2SDatasetConcatV',
-    'DuplexS2SDatasetConcatVCodec',
-    'SALMDataset',
-]
+from nemo.collections.speechlm2.streaming.duplex_stt_inference import DuplexSTTStreamingInference
+
+__all__ = ['DuplexSTTStreamingInference']

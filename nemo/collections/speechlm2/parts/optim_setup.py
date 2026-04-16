@@ -144,5 +144,68 @@ def freeze_and_subset(
         logging.warning(f"Parameter freeze-preventing patterns UNMATCHED against any parameter: {msg} (bad regexp?)")
 
 
+def configure_optimizers_exclude_norm_from_wd(model: LightningModule):
+    """
+    Advanced optimizer configuration for top-level PyTorch Lightning modules.
+
+    Like ``configure_optimizers``, but separates parameters into two groups:
+      1. Standard weights: receive the configured weight decay.
+      2. Biases and normalization layers (LayerNorm, etc.): receive 0.0 weight decay
+         to improve mixed-precision stability (prevents overflow from high-magnitude gradients).
+
+    Expects ``model.cfg`` with:
+      * ``optimizer``           — hydra-style ``_target_`` pointing to optimizer class.
+      * (optional) ``freeze_params``          — regex patterns for frozen parameters.
+      * (optional) ``prevent_freeze_params``  — regex patterns to keep trainable.
+      * (optional) ``lr_scheduler``           — hydra-style ``_target_`` for LR scheduler.
+    """
+    assert hasattr(model, "cfg"), "Expected `model.cfg` attribute to exist."
+    assert "optimizer" in model.cfg, "Expected `model.cfg` to contain 'optimizer' configuration."
+
+    trainable_params_gen = freeze_and_subset(
+        model.named_parameters(),
+        exclude_patterns=model.cfg.get("freeze_params", []),
+        keep_patterns=model.cfg.get("prevent_freeze_params", []),
+    )
+    trainable_param_ids = {id(p) for p in trainable_params_gen}
+
+    no_decay_keywords = ["bias", "norm", "layernorm"]
+    decay_group, no_decay_group, no_decay_names = [], [], []
+    total_trainable = 0
+
+    for name, param in model.named_parameters():
+        if id(param) in trainable_param_ids:
+            total_trainable += 1
+            if any(kw in name.lower() for kw in no_decay_keywords):
+                no_decay_group.append(param)
+                no_decay_names.append(name)
+            else:
+                decay_group.append(param)
+
+    logging.info("=" * 70)
+    logging.info("OPTIMIZER STRATEGY: Mixed Precision Stability (exclude norm/bias from WD)")
+    logging.info(f"Total trainable layers: {total_trainable}")
+    base_wd = model.cfg.optimizer.get("weight_decay", 0.01)
+    logging.info(f"WD={base_wd} applied to {len(decay_group)} weight layers")
+    logging.info(f"WD=0.0 applied to {len(no_decay_names)} norm/bias layers")
+    for n in no_decay_names[:10]:
+        logging.info(f"  [WD=0.0] {n}")
+    if len(no_decay_names) > 10:
+        logging.info(f"  ... (+{len(no_decay_names) - 10} more)")
+    logging.info("=" * 70)
+
+    optim_groups = [
+        {"params": decay_group, "weight_decay": base_wd},
+        {"params": no_decay_group, "weight_decay": 0.0},
+    ]
+    optimizer = hydra.utils.instantiate(model.cfg.optimizer, optim_groups, _convert_='all')
+
+    ans = {"optimizer": optimizer}
+    if "lr_scheduler" in model.cfg:
+        lr_scheduler = hydra.utils.instantiate(model.cfg.lr_scheduler, optimizer)
+        ans["lr_scheduler"] = {"scheduler": lr_scheduler, "interval": "step", "frequency": 1}
+    return ans
+
+
 def is_frozen(module: torch.nn.Module) -> bool:
     return all(not p.requires_grad for p in module.parameters())

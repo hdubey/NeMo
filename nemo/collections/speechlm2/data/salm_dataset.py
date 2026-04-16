@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from itertools import groupby
+from typing import Iterable, Union
 
+import numpy as np
 import torch
 import torch.utils.data
 from lhotse import CutSet
+from torch.nn import CrossEntropyLoss
+from torch.nn.utils.rnn import pad_sequence
 from lhotse.dataset.collation import collate_audio, collate_vectors
 
 from nemo.collections.common.data.lhotse import NeMoMultimodalConversation
@@ -129,3 +133,13 @@ def default_multimodal_conversation_prompt_format_fn(
         turns[0]["role"] = "system_and_user"
         turns[0]["slots"]["system"] = example.system_prompt
     return prompt.encode_dialog(turns)
+
+
+def left_collate_vectors(
+    tensors: Iterable[Union[torch.Tensor, np.ndarray]],
+    padding_value: Union[int, float] = CrossEntropyLoss().ignore_index,
+) -> torch.Tensor:
+    """Left-pad a list of 1-D tensors to equal length (mirrors lhotse's collate_vectors which right-pads)."""
+    tensors = [torch.as_tensor(t) for t in tensors]
+    assert all(len(t.shape) == 1 for t in tensors), "Expected only 1-D input tensors."
+    return pad_sequence(tensors, batch_first=True, padding_value=padding_value, padding_side="left")

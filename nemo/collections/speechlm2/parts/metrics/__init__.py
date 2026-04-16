@@ -12,12 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .asr_bleu import ASRBLEU
+from .asr_cer_wer import Intelligibility
 from .bleu import BLEU
-from .token_accuracy import TokenAccuracy
+from .empty_text import EmptyTextMetric
+from .perplexity import Perplexity, ValidationLoss
 from .results_logger import ResultsLogger
+from .secs import SECS
+from .token_accuracy import TokenAccuracy
+from .turn_taking import TurnTakingMetrics
+from .wer import WER
+
 __all__ = [
     'ASRBLEU',
     'BLEU',
-    'TokenAccuracy',
+    'EmptyTextMetric',
+    'Intelligibility',
+    'Perplexity',
     'ResultsLogger',
+    'SECS',
+    'TokenAccuracy',
+    'TurnTakingMetrics',
+    'ValidationLoss',
+    'WER',
 ]

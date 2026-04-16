@@ -16,6 +16,22 @@ from lightning import LightningDataModule
 from lightning.pytorch.utilities import CombinedLoader
 from omegaconf import DictConfig, OmegaConf, open_dict
 
+try:
+    from nemo.collections.common.data.fallback import FallbackDataset
+except ImportError:
+    # Inline fallback when the NeMo build doesn't include FallbackDataset.
+    class FallbackDataset(torch.utils.data.Dataset):
+        """Wraps a dataset and returns None on exception, so Lhotse can skip bad samples."""
+        def __init__(self, dataset):
+            self.dataset = dataset
+        def __getitem__(self, item):
+            try:
+                return self.dataset[item]
+            except Exception:
+                return None
+        def __len__(self):
+            return len(self.dataset)
+
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.common.tokenizers import TokenizerSpec
 
@@ -75,7 +91,7 @@ class DataModule(LightningDataModule):
             config=self.cfg.train_ds,
             global_rank=self._get_dp_rank(),
             world_size=self._get_world_size(),
-            dataset=self.dataset,
+            dataset=FallbackDataset(self.dataset),
             tokenizer=self.tokenizer,
         )
 
@@ -90,6 +106,21 @@ class DataModule(LightningDataModule):
             return None
         cfg = self.cfg.test_ds
         return self._build_test_dataloader(cfg)
+
+    def predict_dataloader(self):
+        if "predict_ds" not in self.cfg:
+            return None
+        cfg = self.cfg.predict_ds
+        base_cfg = cfg.copy()
+        with open_dict(base_cfg):
+            del base_cfg.datasets
+        dloaders = {}
+        for name, item in cfg.datasets.items():
+            with open_dict(base_cfg):
+                item = OmegaConf.merge(base_cfg, item)
+            dloaders[name] = self._build_test_dataloader(item)
+        # trainer.predict() only supports CombinedLoader(mode="sequential")
+        return CombinedLoader(dloaders, mode="sequential")
 
     def _build_test_dataloader(self, cfg: DictConfig) -> torch.utils.data.DataLoader | CombinedLoader:
         # Single validation/test dataloader.

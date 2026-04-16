@@ -14,9 +14,15 @@
 from .perception import AudioPerceptionModule
 from .speech_generation import TransformerARSpeechDecoder, EOUDecoder, EOUDecoderFromWav
 
+# RVQEARTTSModel and RVQVAEModel are NOT exported here to avoid a circular import:
+#   modules/__init__ → ear_tts_model → parts.pretrained → modules.__init__
+# Import them directly from their submodules instead:
+#   from nemo.collections.speechlm2.modules.ear_tts_model import RVQEARTTSModel
+#   from nemo.collections.speechlm2.modules.ear_tts_vae_codec import RVQVAEModel
+
 __all__ = [
     'AudioPerceptionModule',
-    'TransformerARSpeechDecoder',
     'EOUDecoder',
     'EOUDecoderFromWav',
+    'TransformerARSpeechDecoder',
 ]

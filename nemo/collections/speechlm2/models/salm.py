@@ -14,9 +14,11 @@
 import warnings
 from collections import defaultdict
 from itertools import repeat
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
+from lhotse import CutSet
 from lhotse.dataset.collation import collate_vectors
 from lightning import LightningModule
 from omegaconf import DictConfig
@@ -567,3 +569,188 @@ def replace_placeholders_and_build_targets(
         attention_masks[i, :seq_len] = att
 
     return output, new_target_ids, attention_masks
+def replace_placeholders_and_build_targets(
+    input_ids: torch.Tensor,
+    embeds: torch.Tensor,
+    padding_id: int,
+    placeholder_id: int,
+    replacements: list[torch.Tensor],
+    target_ids: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Replaces each occurrence of the placeholder_id in input_ids with the corresponding tensor
+    from the replacements list in the embeds tensor, and creates corresponding adjusted target_ids.
+
+    Note: when padding is necessary, we apply left-padding to the examples not to introduce
+        anomalies at generation time.
+
+    Args:
+      input_ids (Tensor): shape (batch, sequence_length); input token ids.
+      embeds (Tensor): shape (batch, sequence_length, hidden_dim); embeddings for each token.
+      padding_id (int): these IDs will be marked as ignore_index in target_ids.
+      placeholder_id (int): an id to be replaced.
+      replacements (list of Tensor): each Tensor has shape (L_i, hidden_dim), with L_i arbitrary.
+      target_ids (Tensor): shape (batch, sequence_length); target token ids.
+
+    Returns:
+      Tuple[Tensor, Tensor, Tensor]:
+        - Tensor of shape (batch, max_new_sequence_length, hidden_dim) corresponding to
+          ``embeds`` after replacements.
+        - Tensor of shape (batch, max_new_sequence_length) with adjusted target IDs where:
+          * Original target values are preserved where input was not a placeholder or padding
+          * Positions that were placeholders, padding, or added by replacements are set to -100
+          Will be None if target_ids input was None.
+        - Tensor of shape (batch, max_new_sequence_length) with attention padding masks
+          updated to account for shape changes due to replacements.
+    """
+    batch_size, seq_len = input_ids.size()
+    if target_ids is not None:
+        assert target_ids.size() == input_ids.size(), "target_ids must have the same shape as input_ids"
+
+    hidden_dim = embeds.size(2)
+    device, dtype = embeds.device, embeds.dtype
+    ignore_index = -100  # Standard ignore_index value for CrossEntropyLoss
+
+    # Un-pad the tensors because we'll need to re-apply new padding after replacements anyway.
+    input_ids, embeds, target_ids = _unpad_inputs(input_ids, embeds, target_ids, padding_id)
+
+    output_sequences = []
+    output_target_ids = []
+    output_att_masks = []
+    replacement_idx = 0
+
+    for i in range(batch_size):
+        # Find all placeholder positions at once using tensor operations
+        placeholder_positions = (input_ids[i] == placeholder_id).nonzero(as_tuple=True)[0]
+
+        # Handle the case with no placeholders more efficiently
+        if len(placeholder_positions) == 0:
+            output_sequences.append(embeds[i])
+
+            # Start with original target_ids and replace positions where input was padding
+            if target_ids is not None:
+                new_target_ids = target_ids[i].clone()
+                new_target_ids[input_ids[i] == padding_id] = ignore_index
+                output_target_ids.append(new_target_ids)
+            output_att_masks.append(input_ids[i] != padding_id)
+            continue
+
+        # Build segments between placeholders
+        segments = []  # For embeddings
+        target_segments = []  # For target IDs
+        att_masks = []
+        prev_pos = 0
+
+        for pos in placeholder_positions:
+            # Add segment before placeholder (if any)
+            if pos > prev_pos:
+                segments.append(embeds[i][prev_pos:pos])
+
+                # For target IDs: keep original targets but mark positions that were padding in input
+                if target_ids is not None:
+                    segment_target_ids = target_ids[i][prev_pos:pos].clone()
+                    segment_target_ids[segment_target_ids == padding_id] = ignore_index
+                    target_segments.append(segment_target_ids)
+                att_masks.append(input_ids[i][prev_pos:pos] != padding_id)
+
+            # Add replacement for embeddings
+            rep = replacements[replacement_idx]
+            segments.append(rep)
+
+            # For target IDs: all replacement positions get ignore_index
+            target_segments.append(torch.full((rep.size(0),), ignore_index, dtype=torch.long, device=device))
+            att_masks.append(torch.ones((rep.size(0),), dtype=torch.bool, device=device))
+
+            replacement_idx += 1
+            prev_pos = pos + 1  # Skip placeholder
+
+        # Add remaining segment after last placeholder (if any)
+        if prev_pos < seq_len:
+            segments.append(embeds[i][prev_pos:seq_len])
+
+            # For target IDs: keep original targets but mark positions that were padding in input
+            if target_ids is not None:
+                segment_target_ids = target_ids[i][prev_pos:seq_len].clone()
+                segment_target_ids[segment_target_ids == padding_id] = ignore_index
+                target_segments.append(segment_target_ids)
+            att_masks.append(input_ids[i][prev_pos:seq_len] != padding_id)
+
+        # Concatenate all segments for this example
+        output_sequences.append(torch.cat(segments, dim=0))
+        output_att_masks.append(torch.cat(att_masks, dim=0))
+        if target_ids is not None:
+            output_target_ids.append(torch.cat(target_segments, dim=0))
+
+    # Verify all replacements were used
+    if replacement_idx != len(replacements):
+        raise ValueError(f"Expected {len(replacements)} replacements but used {replacement_idx}")
+
+    # Create padded output tensors
+    max_seq_length = max(seq.size(0) for seq in output_sequences)
+    output = torch.zeros(batch_size, max_seq_length, hidden_dim, device=device, dtype=dtype)
+    if target_ids is not None:
+        new_target_ids = torch.full((batch_size, max_seq_length), ignore_index, dtype=torch.long, device=device)
+    else:
+        new_target_ids = None
+    attention_masks = torch.zeros((batch_size, max_seq_length), dtype=torch.bool, device=device)
+
+    if target_ids is None:
+        output_target_ids = repeat(None)
+    for i, (seq, tgt, att) in enumerate(zip(output_sequences, output_target_ids, output_att_masks)):
+        seq_len = seq.size(0)
+        output[i, -seq_len:] = seq
+        if tgt is not None:
+            new_target_ids[i, -seq_len:] = tgt
+        attention_masks[i, -seq_len:] = att
+
+    return output, new_target_ids, attention_masks
+
+
+def _unpad_inputs(
+    input_ids: torch.Tensor,
+    embeds: torch.Tensor,
+    target_ids: Optional[torch.Tensor],
+    padding_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def first_index_not_value(tensor, value):
+        mask = tensor != value
+        indices = torch.nonzero(mask, as_tuple=False)
+        if indices.numel() > 0:
+            return indices[0].item()
+        else:
+            return -1
+
+    input_ids_unpad, embeds_unpad = [], []
+    target_ids_unpad = [] if target_ids is not None else None
+    for i in range(input_ids.shape[0]):
+        idx = first_index_not_value(input_ids[i], padding_id)
+        input_ids_unpad.append(input_ids[i, idx:])
+        embeds_unpad.append(embeds[i, idx:])
+        if target_ids is not None:
+            target_ids_unpad.append(target_ids[i, idx:])
+    return input_ids_unpad, embeds_unpad, target_ids_unpad
+
+
+def _resolve_audios_in_prompt(
+    prompts: list[list[dict]], sampling_rate: int, device: str | torch.device
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    from lhotse import Recording
+
+    paths = []
+    for conversation in prompts:
+        for turn in conversation:
+            if "audio" in turn:
+                turn_audio = turn["audio"]
+                if isinstance(turn_audio, (str, Path)):
+                    turn_audio = [turn_audio]
+                for p in turn_audio:
+                    assert isinstance(p, (str, Path)), f"Invalid value under prompt key 'audio': {p}"
+                    paths.append(p)
+    if not paths:
+        return None
+    cuts = CutSet([Recording.from_file(p).to_cut() for p in paths])
+    with torch.device("cpu"):  # workaround for a Lhotse issue when default device is CUDA during collation
+        audio, audio_lens = cuts.resample(sampling_rate).load_audio(collate=True)
+    return (
+        torch.as_tensor(audio).to(device, non_blocking=True),
+        torch.as_tensor(audio_lens).to(device, non_blocking=True),
+    )

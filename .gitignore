@@ -1,3 +1,6 @@
+# local planning files
+EARTTS_INTEGRATION_PLAN.md
+
 # log and data files
 *.model
 *.pkl
