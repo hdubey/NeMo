@@ -1,0 +1,239 @@
+# EarTTS config for S2S-ST — LLM backbone: nvidia/Riva-Translate-4B-Instruct-v1.1
+# Branch: voicetranslate-v1/eartts_inter
+# Repo:   github.com/hdubey/private-nv-NeMo-s2s
+# Based on: duplex_eartts_s2s_st_hdubey.yaml (Qwen2.5-1.5B version)
+# Updated: 2026-04-16
+#
+# KEY DIFFERENCES FROM QWEN CONFIG:
+#   - pretrained_lm_name: nvidia/Riva-Translate-4B-Instruct-v1.1 (replaces Qwen2.5-1.5B)
+#   - context_hidden_size: 3072  (Riva-4B hidden dim; was null for Qwen)
+#   - lr: 1e-4 (matches Riva-4B S2S-ST practice; Qwen used 4e-5)
+#   - warmup_steps: 4000 (was 2500)
+#   - exp_manager names updated to riva4b
+#
+# TODO (before first run):
+#   [ ] Set model.pretrained_codec_model to Edresson's RVQVAEModel checkpoint
+#   [ ] Set model.pretrained_tts_model to Edresson's EarTTS TTS checkpoint
+#   [ ] Verify DuplexEARTTSDataset is compatible with S2S-ST lhotse manifests
+#   [ ] Confirm codec_config matches the pretrained codec checkpoint architecture
+
+model:
+  # ------- LM backbone: Riva-Translate-4B-Instruct-v1.1 -------
+  pretrained_lm_name: "/lustre/fsw/portfolios/edgeai/users/amhussein/cache/HFCACHE/hub/models--nvidia--Riva-Translate-4B-Instruct-v1.1/snapshots/f859e48c4c82696c5929cd06590f600a41dc7f3c"
+
+  # ------- Codec (RVQVAEModel — NOT NanoCodec) -------
+  # pretrained_codec_model: /path/to/edresson_rvqvae_codec.ckpt  # TODO: obtain from Edresson
+  pretrained_codec_model: null
+
+  # ------- TTS model checkpoint (EarTTS pretrained weights) -------
+  # pretrained_tts_model: /path/to/edresson_eartts_tts.ckpt  # TODO: obtain from Edresson
+  pretrained_tts_model: null
+
+  # ------- Tokenizer special tokens (null → use Riva-4B tokenizer defaults) -------
+  bos_token: null
+  eos_token: null
+  pad_token: null
+
+  # ------- Codec precision -------
+  audio_codec_run_dtype: float32
+
+  # ------- Loss scaling -------
+  scale_loss_by: non_sil_t
+  scale_loss_mask: 10
+
+  # ------- Inference params -------
+  scoring_asr: stt_en_fastconformer_transducer_large
+  inference_guidance_scale: 0.5
+  inference_noise_scale: 0.8
+  inference_top_p_or_k: 0.8
+  inference_guidance_enabled: true
+
+  # ------- Parameter freezing -------
+  freeze_params:
+    - "^audio_codec\\..+$"      # codec always frozen
+    - "^embed_tokens\\..+$"     # keep embed_tokens frozen
+  prevent_freeze_params: []
+
+  # ------- Optimizer (lr matched to Riva-4B S2S-ST practice) -------
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4
+    betas: [0.9, 0.98]
+    weight_decay: 0.01
+    foreach: true
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.InverseSquareRootAnnealing
+    warmup_steps: 4000
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+  # ------- RVQVAEModel codec architecture -------
+  codec_config:
+    latent_size: 512
+    n_fft: 16
+    hop_length: 4
+    base_hidden_size: 384
+    channel_mult:
+      - 1
+      - 2
+      - 4
+    rates:
+      - 7
+      - 7
+      - 9
+    num_blocks: 3
+    kernel_size: 7
+    groups: 1
+    codebook_size: 1024
+    num_quantizers: 31
+    wav_to_token_ratio: 1764   # 22050 Hz / 12.5 FPS = 1764 samples/frame
+
+  # ------- EarTTS TTS architecture (RVQEARTTSModel) -------
+  tts_config:
+    use_gated_fusion_for_text_audio: true
+    disable_eos_prediction: true
+    use_bos_eos_emb: true
+    use_subword_flag_emb: true
+    num_delay_speech_tokens: 2
+    backbone_type: gemma3_text
+    backbone_model_class: null
+    backbone_config_class: null
+    backbone_config:
+      hidden_size: 1152
+      intermediate_size: 4608
+      num_hidden_layers: 28
+      num_attention_heads: 16
+      num_key_value_heads: 16
+      head_dim: 72
+      attention_dropout: 0.1
+      use_cache: false
+    latent_size: 512
+    codebook_size: 1024
+    num_quantizers: 31
+    context_hidden_size: 3072   # Riva-Translate-4B-Instruct hidden dim (mistral, 34 layers)
+    cas_config:
+      backbone_type: t5gemma
+      backbone_model_class: null
+      backbone_config_class: null
+      backbone_config:
+        is_encoder_decoder: false
+        encoder:
+          hidden_size: 1152
+          intermediate_size: 4608
+          num_hidden_layers: 1
+          num_attention_heads: 16
+          num_key_value_heads: 16
+          head_dim: 72
+          use_cache: false
+          attention_dropout: 0.1
+    mog_head_config:
+      intermediate_size: 4608
+      num_layers: 3
+      low_rank: 64
+      num_predictions: 1024
+      min_log_std: -4.0
+      eps: 1e-06
+    p_uncond: 0.1
+    label_smoothing: 0.01
+    max_training_rate: 0.8
+    quantizer_dropout: 0.5
+    random_target_masking: false
+    exponent: 3.0
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: False
+  enable_checkpointing: False
+  use_distributed_sampler: False
+  max_steps: 100000
+  val_check_interval: 1000
+  limit_train_batches: ${trainer.val_check_interval}
+  limit_val_batches: 1
+  log_every_n_steps: 20
+  num_sanity_val_steps: 0
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+data:
+  add_text_bos_and_eos_in_each_turn: true
+  add_audio_prompt: true
+  add_audio_prompt_after_description: true
+  audio_prompt_duration: 3.0
+  frame_length: 0.08                   # 80ms → 12.5 FPS
+  source_sample_rate: 22050
+  target_sample_rate: 22050
+  input_roles: ["user", "User"]
+  output_roles: ["agent", "Assistant", "assistant", "Agent"]
+
+  train_ds:
+    sample_rate: ${data.target_sample_rate}
+    multi_config: true
+    shuffle: true
+    sampler_fusion: randomized_round_robin
+    seed: 42
+    shard_seed: "trng"
+    sampler_weights:
+      riva_es: 1.0
+    riva_es:
+      input_cfg: /lustre/fsw/portfolios/edgeai/users/amhussein/s2s/configs/data/riva_multiling_st_concat_v_mfa_target_aligned.yaml
+      bucket_buffer_size: 10000
+      shuffle_buffer_size: 10000
+      num_workers: 8
+      pin_memory: true
+      max_duration: 60
+      min_duration: 1
+      num_buckets: 30
+      bucket_duration_bins: [5.33,6.27,6.96,7.54,8.07,8.55,8.99,9.39,9.76,10.14,10.54,10.99,11.49,12.04,12.64,13.28,13.96,14.69,15.48,16.32,17.25,18.28,19.39,20.65,22.14,24.01,26.34,29.21,32.79]
+      batch_duration: 400
+      use_bucketing: true
+      seed: "trng"
+
+  validation_ds:
+    datasets:
+      cvss-FrTest:
+        shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test
+      cvss-EsTest:
+        shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test
+      cvss-DeTest:
+        shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test
+    sample_rate: ${data.target_sample_rate}
+    batch_size: 1
+    seed: 42
+    shard_seed: "randomized"
+
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: /lustre/fsw/portfolios/edgeai/users/hdubey/s2s_exp/eartts/riva4b_run1
+  name: eartts_s2s_st_riva4b
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  use_datetime_version: false
+  max_time_per_run: "00:03:50:00"
+
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+
+  create_wandb_logger: true
+  wandb_logger_kwargs:
+    name: eartts_s2s_st_riva4b
+    project: duplex_s2s_st_eartts
+    entity: riva-nemo-llm-mlops
+    resume: true
+
+  checkpoint_callback_params:
+    filename: "{step}"
+    monitor: val_asr_bleu
+    mode: max
+    every_n_train_steps: null
+    every_n_epochs: 1
+    save_top_k: 3
+    always_save_nemo: false
