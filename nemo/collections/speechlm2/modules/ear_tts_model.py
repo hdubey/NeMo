@@ -1157,6 +1157,27 @@ class RVQEARTTSModel(nn.Module):
             **self.config.mog_head_config,
         )
 
+        # Discrete XE head — predicts codebook indices per quantizer.
+        # Active when audio_loss_type in {"discrete_xe", "combined"}.
+        # Output shape: [B, T, num_quantizers * codebook_size]
+        _loss_type = getattr(self.config, "audio_loss_type", "mog")
+        if _loss_type in ("discrete_xe", "combined"):
+            self.discrete_head = nn.Linear(
+                self.hidden_size,
+                self.config.num_quantizers * self.config.codebook_size,
+                bias=False,
+            )
+        # Flow-matching head placeholder (stub — architecture TBD).
+        # When audio_loss_type="flow_matching", replace mog_head forward with
+        # a conditional flow network (e.g. OT-CFM). Not yet implemented.
+        if _loss_type == "flow_matching":
+            import warnings
+            warnings.warn(
+                "audio_loss_type='flow_matching' is not yet implemented. "
+                "Falling back to 'mog'. Set audio_loss_type='mog' to suppress this warning.",
+                UserWarning,
+            )
+
     def set_rvq_embs(self, rvq_embs: Tensor):
         self.register_buffer("rvq_embs", rvq_embs.detach().clone())
 
@@ -1274,10 +1295,30 @@ class RVQEARTTSModel(nn.Module):
         src_code_mask: Tensor,
         tgt_code_mask: Tensor,
         audio_mask: Tensor,
+        hidden_states: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Helper to compute all losses for the training step."""
+        """
+        Compute all losses for the training step.
+
+        Supports three audio_loss_type modes (set via config / yaml):
+          "mog"         — Mixture-of-Gaussians NLL + KL (Edresson default, kept unchanged)
+          "discrete_xe" — Cross-entropy on codebook indices (Hibiki/VALL-E style)
+          "combined"    — MoG NLL + KL + discrete XE together
+          "flow_matching" — stub, falls back to "mog" until implemented
+
+        Individual loss sub-weights (lm_loss_weight, c_loss_weight, k_loss_weight)
+        are read from config and default to 1.0 for backward compatibility.
+        """
+        loss_type = getattr(self.config, "audio_loss_type", "mog")
+        if loss_type == "flow_matching":
+            loss_type = "mog"   # fallback until implemented
+
+        lm_w = float(getattr(self.config, "lm_loss_weight", 1.0))
+        c_w  = float(getattr(self.config, "c_loss_weight",  1.0))
+        k_w  = float(getattr(self.config, "k_loss_weight",  1.0))
+
         with torch.autocast(code.device.type, enabled=False):
-            # 1. LM Loss (predicting discrete tokens)
+            # ── 1. LM Loss: EOS prediction (cross-entropy, binary) ──────────
             if not self.config.disable_eos_prediction:
                 eos_mask = (~audio_mask) & F.pad(audio_mask[:, :-1], [1, 0])
                 lm_mask = eos_mask | audio_mask
@@ -1288,45 +1329,64 @@ class RVQEARTTSModel(nn.Module):
             else:
                 lm_loss = 0.0
 
-            # 2. Continuous & KL Losses (for the MoG head)
+            # ── Shared masks & targets for audio losses ──────────────────────
             target_mask = (~src_code_mask & tgt_code_mask) & audio_mask.unsqueeze(-1)
             reduced_target_mask = target_mask.any(dim=-1)
 
-            cont_code_target = self.depthsum_embedding(
-                code * target_mask + (torch.zeros_like(code) + self.config.codebook_size) * (~target_mask)
-            )
-            mog_logits = mog_logits.float()
-            mog_mus = mog_mus.float()
-            mog_mu_res = mog_mu_res.float()
-            mog_logs = mog_logs.float()
-            with fp32_precision():
-                # Log probability of the true code under each Gaussian component
-                logp_code = (
-                    -0.5 * math.log(2 * math.pi) - mog_logs
-                ) * self.config.latent_size - 0.5 * self.mog_head.dist(
-                    mog_mus, (cont_code_target - mog_mu_res) * torch.exp(-mog_logs)
+            # ── 2a. MoG NLL + KL (active for "mog" and "combined") ──────────
+            c_loss = k_loss = torch.tensor(0.0, device=code.device)
+            if loss_type in ("mog", "combined"):
+                cont_code_target = self.depthsum_embedding(
+                    code * target_mask + (torch.zeros_like(code) + self.config.codebook_size) * (~target_mask)
                 )
-
-                # Compute posterior q(k|c)
-                q_kc = (
-                    torch.softmax(
-                        logp_code,
-                        -1,
+                mog_logits_ = mog_logits.float()
+                mog_mus_    = mog_mus.float()
+                mog_mu_res_ = mog_mu_res.float()
+                mog_logs_   = mog_logs.float()
+                with fp32_precision():
+                    logp_code = (
+                        -0.5 * math.log(2 * math.pi) - mog_logs_
+                    ) * self.config.latent_size - 0.5 * self.mog_head.dist(
+                        mog_mus_, (cont_code_target - mog_mu_res_) * torch.exp(-mog_logs_)
                     )
-                    * (1 - self.config.label_smoothing)
-                    + self.config.label_smoothing / self.mog_head.num_predictions
-                ).detach()
-                log_q_kc = torch.log(q_kc + 1e-8).detach()
+                    q_kc = (
+                        torch.softmax(logp_code, -1)
+                        * (1 - self.config.label_smoothing)
+                        + self.config.label_smoothing / self.mog_head.num_predictions
+                    ).detach()
+                    log_q_kc = torch.log(q_kc + 1e-8).detach()
+                    # Continuous NLL loss
+                    c_loss = (-(q_kc * logp_code).sum(-1) * reduced_target_mask).sum() / target_mask.sum().clamp_min(1)
+                    # KL divergence loss
+                    k_loss = (
+                        (q_kc * (log_q_kc - F.log_softmax(mog_logits_, -1))).sum(-1) * reduced_target_mask
+                    ).sum() / target_mask.sum().clamp_min(1)
 
-                #  Continuous Loss (negative log-likelihood)
-                c_loss = (-(q_kc * logp_code).sum(-1) * reduced_target_mask).sum() / target_mask.sum().clamp_min(1)
+            # ── 2b. Discrete XE loss (active for "discrete_xe" and "combined") ─
+            # Cross-entropy on RVQ codebook indices (Hibiki / VALL-E style).
+            # Predicts each quantizer's code index independently.
+            dxe_loss = torch.tensor(0.0, device=code.device)
+            if loss_type in ("discrete_xe", "combined") and hidden_states is not None:
+                # discrete_head: [B, T, num_quantizers * codebook_size]
+                dxe_logits = self.discrete_head(hidden_states.float())   # fp32 for stability
+                B, T, NQ = code.shape
+                CS = self.config.codebook_size
+                # Reshape logits: [B, T, NQ, CS] → [B*T*NQ, CS]
+                dxe_logits = dxe_logits.view(B, T, NQ, CS)
+                dxe_logits = dxe_logits[reduced_target_mask]   # [N_valid, NQ, CS]
+                dxe_target = code[reduced_target_mask]          # [N_valid, NQ]
+                if dxe_target.numel() > 0:
+                    dxe_loss = F.cross_entropy(
+                        dxe_logits.reshape(-1, CS),
+                        dxe_target.reshape(-1).long(),
+                        reduction="mean",
+                    )
 
-                # KL Divergence Loss
-                k_loss = (
-                    (q_kc * (log_q_kc - F.log_softmax(mog_logits, -1))).sum(-1) * reduced_target_mask
-                ).sum() / target_mask.sum().clamp_min(1)
-
-        return lm_loss, c_loss, k_loss
+        # ── Apply per-loss sub-weights and return ────────────────────────────
+        # Total = lm_w*lm + c_w*c + k_w*k + dxe_loss (if applicable)
+        # The outer audio_loss_weight is applied in training_step (duplex_ear_tts.py).
+        total_c = c_w * c_loss + k_w * k_loss + dxe_loss
+        return lm_w * lm_loss, total_c, torch.tensor(0.0, device=code.device)
 
     def forward(
         self,
@@ -1538,7 +1598,9 @@ class RVQEARTTSModel(nn.Module):
             mog_logits, mog_mus, mog_mu_res, mog_logs = self.mog_head(mog_input_embeds)
 
             lm_loss, c_loss, k_loss = self._compute_losses(
-                code, lm_logits, mog_logits, mog_mus, mog_mu_res, mog_logs, src_code_mask, tgt_code_mask, audio_mask
+                code, lm_logits, mog_logits, mog_mus, mog_mu_res, mog_logs,
+                src_code_mask, tgt_code_mask, audio_mask,
+                hidden_states=hidden_states,
             )
             total_loss = lm_loss + c_loss + k_loss
 

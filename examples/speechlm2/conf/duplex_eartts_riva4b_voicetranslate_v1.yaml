@@ -30,6 +30,26 @@ model:
 
   scoring_asr: stt_en_fastconformer_transducer_large
 
+  # ── Combined loss weights (Nourchene-style) ─────────────────────────────────
+  # audio_loss_weight : multiplier on EarTTS audio output loss
+  # text_loss_weight  : multiplier on source-language transcription loss (ASR head)
+  # Nourchene uses audio=4, text=3 for DuplexS2S — kept as default here.
+  audio_loss_weight: 4
+  text_loss_weight: 3
+
+  # ── Audio loss type ──────────────────────────────────────────────────────────
+  # "mog"          — Mixture-of-Gaussians NLL + KL (Edresson default, best tested)
+  # "discrete_xe"  — Cross-entropy on codebook indices (Hibiki/VALL-E style, simpler)
+  # "combined"     — MoG NLL + KL + discrete XE together (most signal, recommended)
+  # "flow_matching" — OT-CFM on codec latents (SOTA quality; stub, not yet implemented)
+  audio_loss_type: "mog"   # DEFAULT: keep Edresson's proven loss until ablation done
+
+  # ── EarTTS sub-loss weights (active for "mog" and "combined") ───────────────
+  # All default to 1.0 — identical to original Edresson behaviour.
+  lm_loss_weight: 1.0      # EOS token prediction (cross-entropy)
+  c_loss_weight:  1.0      # MoG NLL (continuous codec latent loss)
+  k_loss_weight:  1.0      # KL divergence (mixture prior regularization)
+
   # Regexp (re.compile) patterns matching parameters to be frozen.
   freeze_params:
     - "^audio_codec\\..+$"

@@ -2,6 +2,10 @@
 EARTTS_INTEGRATION_PLAN.md
 TRAINING_PLANS.md
 STEPS_random_model_creation.md
+STEPS_random_model_creation_v2.md
+STEPS_voicetranslate_GRPO_v1.md
+STEPS_voicetranslate_costfunction_v1.md
+voicetranslate-v1-model-size.md
 scripts/
 
 # log and data files

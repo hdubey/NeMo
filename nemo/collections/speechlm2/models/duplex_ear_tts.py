@@ -622,7 +622,10 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             tiled_prompt_subword_mask=inputs["tiled_prompt_subword_mask"],
         )
         loss_dict = {"lm_loss": tts_output.lm_loss, "c_loss": tts_output.c_loss, "k_loss": tts_output.k_loss}
-        loss = sum(loss_dict.values())
+        # audio_loss_weight: scales the full EarTTS audio loss (default 1.0 = unchanged).
+        # Set via yaml: model.audio_loss_weight (e.g. 4 per Nourchene's convention).
+        audio_loss_weight = float(getattr(self.cfg, "audio_loss_weight", 1.0))
+        loss = audio_loss_weight * sum(loss_dict.values())
 
         num_frames = inputs["output_lens"].sum()
         B, T = inputs["code"].shape[:2]
