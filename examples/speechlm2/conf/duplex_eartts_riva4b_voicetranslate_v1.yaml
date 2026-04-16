@@ -204,8 +204,8 @@ data:
       riva_mult: 1.0
     riva_mult:
       input_cfg: /lustre/fsw/portfolios/edgeai/users/amhussein/s2s/configs/data/riva_multiling_st_concat_v_mfa_target_aligned.yaml
-      bucket_buffer_size: 10000
-      shuffle_buffer_size: 10000
+      bucket_buffer_size: 2000    # reduced from 10000 — fills in ~18 min vs ~90 min
+      shuffle_buffer_size: 2000
       num_workers: 8
       pin_memory: true
       max_duration: 60
