@@ -95,8 +95,11 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             self.prefix = ""
 
         # flag for enabling multistorageclient checkpointing
+        # Always pop first to avoid passing unknown kwarg to super().__init__()
+        # (MULTISTORAGECLIENT_AVAILABLE may be False, which would short-circuit kwargs.pop)
         if 'multistorageclient_enabled' in kwargs:
-            self.multistorageclient_enabled = MULTISTORAGECLIENT_AVAILABLE and kwargs.pop('multistorageclient_enabled')
+            msc_enabled = kwargs.pop('multistorageclient_enabled')
+            self.multistorageclient_enabled = MULTISTORAGECLIENT_AVAILABLE and msc_enabled
 
         # Call the parent class constructor with the remaining kwargs.
         super().__init__(**kwargs)

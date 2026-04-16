@@ -18,7 +18,8 @@ import torch
 from lightning.pytorch import Trainer
 from omegaconf import OmegaConf
 
-from nemo.collections.speechlm2 import DataModule, DuplexEARTTSDataset
+from nemo.collections.speechlm2 import DataModule
+from nemo.collections.speechlm2.data import DuplexEARTTSDataset
 from nemo.collections.speechlm2.models.duplex_ear_tts import DuplexEARTTS
 from nemo.collections.speechlm2.parts.pretrained import load_checkpoint, set_model_dict_for_partial_init
 from nemo.core.config import hydra_runner

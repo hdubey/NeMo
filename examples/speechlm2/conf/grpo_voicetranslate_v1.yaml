@@ -1,105 +1,70 @@
-# VoiceTranslate-v1 — DuplexEARTTS + Riva-Translate-4B-Instruct
-# Branch: voicetranslate-v1/eartts_inter
-# Repo:   github.com/hdubey/private-nv-NeMo-s2s (private)
-# Created: 2026-04-16
-#
-# BASE: examples/speechlm2/conf/duplex_eartts.yaml (Edresson's base — kept as-is)
-# CHANGES vs Edresson's base (minimum required):
-#   1. pretrained_lm_name  : Nemotron-9B → Riva-Translate-4B-Instruct-v1.1 (local path)
-#   2. pretrained_audio_codec removed; pretrained_codec_model: null added  (TODO: Edresson ckpt)
-#   3. bos/eos/pad tokens  : Nemotron tokens → null (use Riva-4B tokenizer defaults)
-#   4. optimizer.lr        : 4e-5 → 1e-4  (Nourchene's Riva-4B setting)
-#   5. optimizer.warmup    : 2500 → 4000  (Nourchene's Riva-4B setting)
-#   6. trainer.precision   : 32 → bf16-true
-#   7. trainer.max_steps   : 1000000 → 100000
-#   8. data.train_ds       : ??? → Nourchene's multi_config lhotse shards (FR/ES/DE→EN)
-#   9. data.validation_ds  : ??? → Nourchene's CVSS eval sets
-#  10. exp_manager paths   : updated to hdubey's dirs
-#
-# UNTOUCHED from Edresson (everything else):
-#   tts_config (backbone, cas_config, mog_head, all params)
-#   codec_config (all params)
-#   freeze_params, inference params, DDP strategy, gradient_clip_val
+# VoiceTranslate-v1 — GRPO Stage 2 Config
+# Reference: Hibiki-Zero (Kyutai, 2025) https://arxiv.org/abs/2502.03382
+# Init from: best SFT checkpoint (duplex_eartts_riva4b_voicetranslate_v1.yaml)
 
 model:
   pretrained_lm_name: "/lustre/fsw/portfolios/edgeai/users/amhussein/cache/HFCACHE/hub/models--nvidia--Riva-Translate-4B-Instruct-v1.1/snapshots/f859e48c4c82696c5929cd06590f600a41dc7f3c"
-
-  # TODO: obtain from Edresson once available
   pretrained_codec_model: null
   pretrained_tts_model: null
 
+  # SFT checkpoint to init GRPO policy from (fill after SFT run 2 completes)
+  pretrained_model: null   # TODO: /path/to/sft_best.ckpt
+
   scoring_asr: stt_en_fastconformer_transducer_large
 
-  # ── Combined loss weights (Nourchene-style) ─────────────────────────────────
-  # audio_loss_weight : multiplier on EarTTS audio output loss
-  # text_loss_weight  : multiplier on source-language transcription loss (ASR head)
-  # Nourchene uses audio=4, text=3 for DuplexS2S — kept as default here.
-  audio_loss_weight: 4
-  text_loss_weight: 3
-
-  # ── Audio loss type ──────────────────────────────────────────────────────────
-  # "mog"          — Mixture-of-Gaussians NLL + KL (Edresson default, best tested)
-  # "discrete_xe"  — Cross-entropy on codebook indices (Hibiki/VALL-E style, simpler)
-  # "combined"     — MoG NLL + KL + discrete XE together (most signal, recommended)
-  # "flow_matching" — OT-CFM on codec latents (SOTA quality; stub, not yet implemented)
-  audio_loss_type: "mog"   # DEFAULT: keep Edresson's proven loss until ablation done
-
-  # ── EarTTS sub-loss weights (active for "mog" and "combined") ───────────────
-  # All default to 1.0 — identical to original Edresson behaviour.
-  lm_loss_weight: 1.0      # EOS token prediction (cross-entropy)
-  c_loss_weight:  1.0      # MoG NLL (continuous codec latent loss)
-  k_loss_weight:  1.0      # KL divergence (mixture prior regularization)
-
-  # Regexp (re.compile) patterns matching parameters to be frozen.
-  # Nourchene convention (adapted for DuplexEARTTS):
-  #   audio_codec     — always frozen (codec used only for encoding/decoding, no pretrained ckpt yet)
-  #   tts_model.backbone — frozen for initial debug/SFT; remove this line for full LLM-unfreeze run
-  # NOTE: there is no perception encoder in DuplexEARTTS (unlike DuplexS2SSpeechDecoderModel),
-  #       so "freeze ASR encoder" (^perception.encoder) does not apply here.
-  freeze_params:
-    - "^audio_codec\\..+$"             # RVQVAEModel codec — always frozen
-    - "^tts_model\\.backbone\\..+$"    # Gemma3 TTS backbone — frozen for debug; unfreeze for full SFT
-  prevent_freeze_params: []
-
-  # Riva-4B tokenizer defaults (null = use tokenizer's own bos/eos/pad)
   bos_token: null
   eos_token: null
   pad_token: null
 
-  # inference params — unchanged from Edresson
+  audio_loss_weight: 1.0   # not used in GRPO (overridden by pg_loss)
+  audio_loss_type: "mog"
+  lm_loss_weight: 1.0
+  c_loss_weight:  1.0
+  k_loss_weight:  1.0
+
+  # ── GRPO hyperparameters (Hibiki-Zero defaults) ──────────────────────────
+  grpo:
+    num_generations: 8       # G — samples per input (Hibiki-Zero: 8)
+    kl_coeff: 0.04           # KL penalty (GRPO paper: 0.04)
+    reward_clip: 100.0       # clip BLEU to [0, 100]
+    gen_max_steps: 500       # max codec frames per generation (~11s at 22kHz)
+
   inference_guidance_scale: 0.5
   inference_noise_scale: 0.8
   inference_top_p_or_k: 0.8
   inference_guidance_enabled: true
 
-  # optimizer — lr/warmup updated to Nourchene's Riva-4B settings; rest unchanged
+  # Nourchene convention (adapted for DuplexEARTTS):
+  #   audio_codec       — always frozen
+  #   tts_model.backbone — frozen for initial debug; remove for full GRPO run
+  # NOTE: no perception encoder in DuplexEARTTS, so ^perception.encoder freeze does not apply.
+  freeze_params:
+    - "^audio_codec\\..+$"             # RVQVAEModel codec — always frozen
+    - "^tts_model\\.backbone\\..+$"    # Gemma3 TTS backbone — frozen for debug; unfreeze for full GRPO
+  prevent_freeze_params: []
+
+  # optimizer — lower lr than SFT (RL is more sensitive)
   optimizer:
     _target_: torch.optim.AdamW
-    lr: 1e-4
+    lr: 5e-6        # 20x lower than SFT lr=1e-4
     betas: [0.9, 0.98]
     weight_decay: 0
     foreach: true
 
   lr_scheduler:
     _target_: nemo.core.optim.lr_scheduler.InverseSquareRootAnnealing
-    warmup_steps: 4000
-    min_lr: 1e-6
+    warmup_steps: 100
+    min_lr: 1e-7
     max_steps: ${trainer.max_steps}
 
-  # codec_config — UNCHANGED from Edresson
+  # tts_config and codec_config — identical to SFT yaml (unchanged)
   codec_config:
     latent_size: 512
     n_fft: 16
     hop_length: 4
     base_hidden_size: 384
-    channel_mult:
-      - 1
-      - 2
-      - 4
-    rates:
-      - 7
-      - 7
-      - 9
+    channel_mult: [1, 2, 4]
+    rates: [7, 7, 9]
     num_blocks: 3
     kernel_size: 7
     groups: 1
@@ -107,7 +72,6 @@ model:
     num_quantizers: 31
     wav_to_token_ratio: 1764
 
-  # tts_config — UNCHANGED from Edresson
   tts_config:
     use_gated_fusion_for_text_audio: true
     disable_eos_prediction: true
@@ -132,8 +96,6 @@ model:
     context_hidden_size: null
     cas_config:
       # t5gemma is not registered in the container's transformers version — use BertModel as drop-in.
-      # When t5gemma support lands (transformers >= x.x.x), restore: backbone_type: t5gemma,
-      # backbone_model_class: null, backbone_config_class: null, and the encoder sub-config.
       backbone_type: null
       backbone_model_class: BertModel
       backbone_config_class: BertConfig
@@ -160,7 +122,6 @@ model:
     random_target_masking: false
     exponent: 3.0
 
-# trainer — precision and max_steps updated; rest unchanged from Edresson
 trainer:
   devices: -1
   accelerator: gpu
@@ -169,11 +130,11 @@ trainer:
   logger: False
   enable_checkpointing: False
   use_distributed_sampler: False
-  max_steps: 100000
-  val_check_interval: 1000
+  max_steps: 10000
+  val_check_interval: 500
   limit_train_batches: ${trainer.val_check_interval}
   limit_val_batches: 2
-  log_every_n_steps: 20
+  log_every_n_steps: 10
   num_sanity_val_steps: 0
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1
@@ -182,7 +143,6 @@ trainer:
     gradient_as_bucket_view: true
     find_unused_parameters: true
 
-# data — train_ds/validation_ds filled from Nourchene; frame params unchanged from Edresson
 data:
   add_text_bos_and_eos_in_each_turn: true
   add_audio_prompt_after_description: true
@@ -193,6 +153,7 @@ data:
   input_roles: ["user", "User"]
   output_roles: ["agent", "Assistant", "assistant", "Agent"]
 
+  # GRPO can use unaligned data — only needs source speech + EN reference text
   train_ds:
     sample_rate: ${data.target_sample_rate}
     multi_config: true
@@ -204,16 +165,16 @@ data:
       riva_mult: 1.0
     riva_mult:
       input_cfg: /lustre/fsw/portfolios/edgeai/users/amhussein/s2s/configs/data/riva_multiling_st_concat_v_mfa_target_aligned.yaml
-      bucket_buffer_size: 10000
-      shuffle_buffer_size: 10000
+      bucket_buffer_size: 5000
+      shuffle_buffer_size: 5000
       num_workers: 8
       pin_memory: true
       max_duration: 60
       min_duration: 1
       num_buckets: 30
       bucket_duration_bins: [5.33,6.27,6.96,7.54,8.07,8.55,8.99,9.39,9.76,10.14,10.54,10.99,11.49,12.04,12.64,13.28,13.96,14.69,15.48,16.32,17.25,18.28,19.39,20.65,22.14,24.01,26.34,29.21,32.79]
-      batch_duration: 400
-      batch_size: 4
+      batch_duration: 200    # smaller batch — GRPO generates G=8 samples per input
+      batch_size: 1
       use_bucketing: true
       seed: 'trng'
 
@@ -232,24 +193,21 @@ data:
 
 exp_manager:
   exp_dir: null
-  explicit_log_dir: /lustre/fsw/portfolios/edgeai/users/hdubey/s2s_exp/eartts/riva4b_vt_v1
-  name: eartts_riva4b_voicetranslate_v1
+  explicit_log_dir: /lustre/fsw/portfolios/edgeai/users/hdubey/s2s_exp/eartts/riva4b_vt_v1_GRPO
+  name: eartts_riva4b_vt_v1_GRPO
   create_tensorboard_logger: false
   create_checkpoint_callback: true
   use_datetime_version: false
   max_time_per_run: "00:03:50:00"
-
   resume_from_checkpoint: null
   resume_if_exists: true
   resume_ignore_no_checkpoint: true
-
   create_wandb_logger: true
   wandb_logger_kwargs:
-    name: eartts_riva4b_voicetranslate_v1
+    name: eartts_riva4b_vt_v1_GRPO
     project: duplex_s2s_st_eartts
     entity: riva-nemo-llm-mlops
     resume: true
-
   checkpoint_callback_params:
     filename: "{step}"
     monitor: val_asr_bleu

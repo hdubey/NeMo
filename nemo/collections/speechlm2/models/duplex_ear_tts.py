@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from lightning import LightningModule
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from peft import PeftModel
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import Replicate, Shard
@@ -102,7 +102,14 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         )  # Note that we are using fast tokenizer
 
         # Instantiate TTS model
-        self.tts_model = RVQEARTTSModel(DictConfig(self.cfg.tts_config), tokenizer=self.tokenizer)
+        # Merge model-level loss config into tts_config so RVQEARTTSModel._compute_losses
+        # can read audio_loss_type / lm_loss_weight / c_loss_weight / k_loss_weight from yaml.
+        tts_cfg = OmegaConf.to_container(self.cfg.tts_config, resolve=True)
+        for key in ("audio_loss_type", "lm_loss_weight", "c_loss_weight", "k_loss_weight"):
+            val = self.cfg.get(key, None)
+            if val is not None:
+                tts_cfg[key] = val
+        self.tts_model = RVQEARTTSModel(DictConfig(tts_cfg), tokenizer=self.tokenizer)
         # Load and initialize audio codec, and bind RVQ embeddings to the TTS model
         setup_audio_codec(self)
 
@@ -575,7 +582,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             tp_world_size = self.device_mesh["tensor_parallel"].size()
             if (remainder := (target_text_tokens.shape[1] - 1) % tp_world_size) != 0:
                 target_text_tokens = target_text_tokens[:, :-remainder]
-                target_codes_aligned = target_codes_aligned[:, :-remainder]
                 target_codes_aligned = target_codes_aligned[:, :-remainder]
                 subword_ids = subword_ids[:, :-remainder]
                 subword_mask = subword_mask[:, :-remainder]

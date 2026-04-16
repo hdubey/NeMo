@@ -1,11 +1,12 @@
-# local planning files
+# local planning / log files (keep all top-level .md files local)
+STEPS_*.md
+ADVICE_*.md
+*_TRAINING_LOG.md
+*_LOG.md
+my_*.md
+voicetranslate-v1-model-size.md
 EARTTS_INTEGRATION_PLAN.md
 TRAINING_PLANS.md
-STEPS_random_model_creation.md
-STEPS_random_model_creation_v2.md
-STEPS_voicetranslate_GRPO_v1.md
-STEPS_voicetranslate_costfunction_v1.md
-voicetranslate-v1-model-size.md
 scripts/
 
 # log and data files
