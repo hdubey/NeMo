@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 import random
 import re
 from copy import deepcopy
@@ -164,9 +165,15 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
         # ensures fp32 audio load to avoid issues of duration mistakes on fp16 training
         with fp32_precision():
             source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
-            target_audio, target_audio_lens = collate_audio(
-                cuts.resample(self.target_sample_rate, recording_field="target_audio"), recording_field="target_audio"
+            # recording_field kwarg not available in container Lhotse version;
+            # swap each cut's recording to its target_audio field before resampling.
+            # Fallback to recording for CVSS eval cuts which have no target_audio field.
+            _has_target_audio = hasattr(cuts[0], "target_audio")
+            target_cuts = CutSet.from_cuts(
+                dataclasses.replace(c, recording=c.target_audio if _has_target_audio else c.recording)
+                for c in cuts
             )
+            target_audio, target_audio_lens = collate_audio(target_cuts.resample(self.target_sample_rate))
         target_text_tokens, target_token_lens = collate_token_channel(
             cuts,
             self.tokenizer,
@@ -182,8 +189,10 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
             add_text_bos_and_eos_in_each_turn=self.add_text_bos_and_eos_in_each_turn,
         )
         with fp32_precision():
+            # Pass recording_field only when target_audio exists; CVSS eval cuts use "recording".
             audio_prompt, audio_prompt_lens = get_audio_prompt(
-                cuts, self.target_sample_rate, roles=self.output_roles, recording_field="target_audio"
+                cuts, self.target_sample_rate, roles=self.output_roles,
+                recording_field="target_audio" if _has_target_audio else "recording",
             )
 
         # add speech channel delay if needed
@@ -672,11 +681,17 @@ def get_audio_prompt(
         # Sanitize cuts to remove out-of-bounds supervisions
         # this prevents crashes when sampling from truncated audio.
         cuts = sanitize_cuts(cuts)
-        # sample a reference turn from the target-role speakers
+        # recording_field kwarg not available in container Lhotse version;
+        # swap each cut's recording to the desired field, then resample using default "recording".
+        if recording_field != "recording":
+            cuts = CutSet.from_cuts(
+                dataclasses.replace(c, recording=getattr(c, recording_field, c.recording))
+                for c in cuts
+            )
         audio_prompt, audio_prompt_lens = collate_random_turn_audio(
-            cuts.resample(target_sample_rate, recording_field=recording_field),
+            cuts.resample(target_sample_rate),
             roles=roles,
-            recording_field=recording_field,
+            recording_field="recording",
         )
 
     return audio_prompt, audio_prompt_lens
@@ -781,10 +796,15 @@ def collate_random_turn_audio(
             # Randomly select one supervision
             selected_supervision = random.choice(matching_supervisions)
 
-            # Truncate audio according to supervision
-            truncated_audio = cut.truncate(
+            # Truncate audio according to supervision.
+            # "recording" is a built-in MonoCut field — use load_audio(), not load_custom().
+            truncated_cut = cut.truncate(
                 offset=max(0, selected_supervision.start), duration=selected_supervision.duration
-            ).load_custom(recording_field)
+            )
+            if recording_field == "recording":
+                truncated_audio = truncated_cut.load_audio()
+            else:
+                truncated_audio = truncated_cut.load_custom(recording_field)
 
             selected_turn_audios.append(truncated_audio.squeeze(0))
             selected_turn_audios_lens.append(truncated_audio.shape[-1])

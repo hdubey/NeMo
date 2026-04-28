@@ -132,8 +132,8 @@ def load_checkpoint(checkpoint_path: str) -> Dict:
     """
     Load a model checkpoint from disk.
 
-    Supports PyTorch (``.ckpt``, ``.pt``) and SafeTensors (``.safetensors``) formats.
-    All tensors are loaded onto CPU.
+    Supports PyTorch (``.ckpt``, ``.pt``), NeMo (``.nemo`` tar archive),
+    and SafeTensors (``.safetensors``) formats. All tensors are loaded onto CPU.
 
     Args:
         checkpoint_path: Path to the checkpoint file.
@@ -143,8 +143,18 @@ def load_checkpoint(checkpoint_path: str) -> Dict:
     """
     if ".safetensors" in checkpoint_path:
         return load_file(checkpoint_path, device="cpu")
+    elif checkpoint_path.endswith(".nemo"):
+        # NeMo archives are tar files containing model_weights.ckpt
+        import io
+        import tarfile
+        with tarfile.open(checkpoint_path, "r:*") as tar:
+            weights_member = next(m for m in tar.getmembers() if m.name.endswith("model_weights.ckpt"))
+            buf = tar.extractfile(weights_member).read()
+        ckpt = torch.load(io.BytesIO(buf), map_location="cpu", weights_only=False)
+        # NeMo model_weights.ckpt is a flat state dict (no "state_dict" wrapper)
+        return ckpt.get("state_dict", ckpt)
     else:
-        return torch.load(checkpoint_path, map_location="cpu")["state_dict"]
+        return torch.load(checkpoint_path, map_location="cpu", weights_only=False)["state_dict"]
 
 
 def _load_checkpoint_state(checkpoint_path: str) -> Dict:

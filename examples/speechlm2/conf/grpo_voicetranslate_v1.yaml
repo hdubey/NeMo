@@ -206,7 +206,7 @@ exp_manager:
   wandb_logger_kwargs:
     name: eartts_riva4b_vt_v1_GRPO
     project: duplex_s2s_st_eartts
-    entity: riva-nemo-llm-mlops
+    entity: nv-welcome
     resume: true
   checkpoint_callback_params:
     filename: "{step}"

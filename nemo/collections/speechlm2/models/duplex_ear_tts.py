@@ -56,6 +56,7 @@ from nemo.collections.speechlm2.parts.pretrained import (
     load_pretrained_hf,
     set_model_dict_for_partial_init,
 )
+from transformers import DynamicCache
 from nemo.utils import logging
 
 
@@ -110,6 +111,53 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             if val is not None:
                 tts_cfg[key] = val
         self.tts_model = RVQEARTTSModel(DictConfig(tts_cfg), tokenizer=self.tokenizer)
+        # Load pretrained TTS checkpoint if provided (Edresson's pre-trained EarTTS weights).
+        # Must happen before setup_audio_codec so RVQ embeddings are bound to loaded weights.
+        pretrained_tts = self.cfg.get("pretrained_tts_model", None)
+        if pretrained_tts:
+            checkpoint_state = load_checkpoint(pretrained_tts)
+            model_sd = self.tts_model.state_dict()
+
+            # Detect checkpoint type:
+            # Case A: Full DuplexEARTTS checkpoint (Edresson's tts-pretraining ckpt).
+            #   - Backbone is under 'llm.*' (shared backbone, must remap → 'backbone.*')
+            #   - Audio head is under 'speech_generation.*' (audio_embeddings, cas_encoder)
+            # Case B: Standalone RVQEARTTSModel checkpoint (flat keys matching model_sd directly)
+            is_full_duplex_ckpt = any(k.startswith("llm.") for k in checkpoint_state) and any(
+                k.startswith("speech_generation.") for k in checkpoint_state
+            )
+
+            if is_full_duplex_ckpt:
+                logging.info("Detected full DuplexEARTTS checkpoint. Remapping llm.* → backbone.* "
+                             "and speech_generation.* → matching tts_model keys.")
+                tts_state = {}
+                # Remap llm.* → backbone.* (the TTS backbone in our RVQEARTTSModel)
+                for k, v in checkpoint_state.items():
+                    if k.startswith("llm."):
+                        tts_state["backbone." + k[len("llm."):]] = v
+                    elif k.startswith("speech_generation."):
+                        # cas_encoder.* and audio_embeddings.* from speech_generation
+                        tts_state[k[len("speech_generation."):]] = v
+                logging.info(f"  Remapped {len(tts_state)} keys from full DuplexEARTTS ckpt.")
+                logging.info(f"  Sample ckpt keys: {list(tts_state.keys())[:3]}")
+                logging.info(f"  Sample model keys: {list(model_sd.keys())[:3]}")
+            else:
+                # Standalone: try common prefixes used in earlier checkpoints
+                _prefixes_to_try = ["speech_generation.tts_model.", "speech_generation.", "tts_model.", ""]
+                tts_state = {}
+                for _prefix in _prefixes_to_try:
+                    if _prefix:
+                        tts_state = {k[len(_prefix):]: v for k, v in checkpoint_state.items()
+                                     if k.startswith(_prefix)}
+                    else:
+                        tts_state = dict(checkpoint_state)
+                    if tts_state:
+                        logging.info(f"TTS ckpt prefix '{_prefix}' matched {len(tts_state)} keys.")
+                        break
+
+            tts_state = set_model_dict_for_partial_init(tts_state, model_sd)
+            self.tts_model.load_state_dict(tts_state, strict=True)
+            logging.info(f"TTS model restored from pretrained checkpoint: {pretrained_tts}")
         # Load and initialize audio codec, and bind RVQ embeddings to the TTS model
         setup_audio_codec(self)
 
@@ -1442,7 +1490,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             generation_config = self._get_generation_config(guidance_enabled)
             logging.info(f"Doing inference using the following config: {generation_config} !")
 
-        init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": guidance_enabled})
+        # Use DynamicCache (grows as needed) instead of None so Gemma3TextModel does NOT
+        # create a HybridCache capped at warmup seq_len, which causes OOB at AR step 2+.
+        init_inputs.update({"use_cache": True, "past_key_values": DynamicCache(), "guidance_enabled": guidance_enabled})
 
         # warmup the model and generate the very first audio token
         outputs = self.tts_model(**init_inputs)
@@ -1702,6 +1752,28 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             IncompatibleKeys:
                 As returned by LightningModule.load_state_dict.
         """
+        # Remap Edresson's full DuplexEARTTS checkpoint keys to our attribute names:
+        #   llm.*              → tts_model.backbone.*  (shared backbone → separate TTS backbone)
+        #   speech_generation.* → tts_model.{stripped}  (audio head: audio_embeddings, cas_encoder)
+        is_full_duplex_ckpt = any(k.startswith("llm.") for k in state_dict) and any(
+            k.startswith("speech_generation.") for k in state_dict
+        )
+        if is_full_duplex_ckpt:
+            remapped = {}
+            llm_count = sg_count = 0
+            for k, v in state_dict.items():
+                if k.startswith("llm."):
+                    remapped["tts_model.backbone." + k[len("llm."):]] = v
+                    llm_count += 1
+                elif k.startswith("speech_generation."):
+                    remapped["tts_model." + k[len("speech_generation."):]] = v
+                    sg_count += 1
+                else:
+                    remapped[k] = v
+            logging.info(f"Full DuplexEARTTS ckpt remapping: llm.*({llm_count}) → tts_model.backbone.*, "
+                         f"speech_generation.*({sg_count}) → tts_model.*")
+            state_dict = remapped
+
         # recreate audio prompt latent entries if needed
         self.maybe_recreate_cached_audio_prompt_latents_structure(state_dict)
         try:
@@ -1843,7 +1915,31 @@ def setup_audio_codec(model):
         # load pretrained codec checkpoint
         if model.cfg.get("pretrained_codec_model", None):
             checkpoint_state = load_checkpoint(model.cfg.pretrained_codec_model)
-            checkpoint_state = set_model_dict_for_partial_init(checkpoint_state, model.audio_codec.state_dict())
+            # Map various checkpoint key formats → RVQVAEModel key names.
+            # eartts_rvq_cont_task.ckpt uses: audio_codec.decoder/encoder/prvq.*
+            # NanoCodec .nemo uses:           audio_encoder/audio_decoder/vector_quantizer.*
+            # (NanoCodec is FSQ-based and architecturally incompatible, but mapping is kept for reference)
+            _key_map = {
+                "audio_codec.decoder.": "decoder.",
+                "audio_codec.encoder.": "encoder.",
+                "audio_codec.prvq.": "prvq.",
+                "audio_codec.audio_encoder.": "encoder.",
+                "audio_codec.audio_decoder.": "decoder.",
+                "audio_codec.vector_quantizer.": "prvq.",
+                "audio_encoder.": "encoder.",
+                "audio_decoder.": "decoder.",
+                "vector_quantizer.": "prvq.",
+            }
+            remapped = {}
+            for k, v in checkpoint_state.items():
+                new_k = k
+                for old_prefix, new_prefix in _key_map.items():
+                    if k.startswith(old_prefix):
+                        new_k = new_prefix + k[len(old_prefix):]
+                        break
+                remapped[new_k] = v
+            n_before = len(checkpoint_state)
+            checkpoint_state = set_model_dict_for_partial_init(remapped, model.audio_codec.state_dict())
             model.audio_codec.load_state_dict(checkpoint_state, strict=True)
 
     for p in model.audio_codec.parameters():

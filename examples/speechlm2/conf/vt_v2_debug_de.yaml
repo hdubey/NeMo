@@ -1,0 +1,264 @@
+# VoiceTranslateV2 — DEBUG config (German-only, 5 steps)
+# Inherits all model settings from voice_translate_v2_stages.yaml.
+# Override only training counts and data to use German-only single-shard data.
+
+training_stages:
+  stage1_steps: 5
+  stage2_steps: 0
+  stage3_steps: 0
+  stage2_text_loss_weight: 100.0
+
+model:
+  pretrained_lm_name: "/lustre/fsw/portfolios/edgeai/users/amhussein/cache/HFCACHE/hub/models--nvidia--Riva-Translate-4B-Instruct-v1.1/snapshots/f859e48c4c82696c5929cd06590f600a41dc7f3c"
+  pretrained_weights: false        # random LLM weights — fast init for debug
+
+  pretrained_asr: null
+  pretrained_tts_model: null
+  pretrained_codec_model: "/lustre/fsw/portfolios/edgeai/users/hdubey/pretrained_models/full-duplex/models/tts/ear-tts/eartts_rvq_cont_task_qwen_22khz_synthetic_duplex_data_plus_blackwell_4nodes_FT_cont_22khz_12.5FPS_text_bos_eos_fix_duplex_nanov2_new_special_tokens_no_context_emb_20366-last.ckpt"
+  pretrained_model: null
+
+  text_loss_weight: 0.0
+  audio_loss_weight: 4.0
+  audio_loss_type: "mog"
+  lm_loss_weight: 1.0
+  c_loss_weight: 1.0
+  k_loss_weight: 1.0
+
+  scoring_asr: stt_en_fastconformer_transducer_large
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.04
+    eps_clip: 0.2
+    reward_clip: 100.0
+    gen_max_steps: 500
+    utmos_weight: 0.0
+
+  bos_token: null
+  eos_token: null
+  pad_token: null
+
+  freeze_params:
+    - "^audio_codec\\..+$"
+    - "^embed_tokens\\..+$"
+    - "^language_model\\..+$"
+    - "^lm_head\\..+$"
+  prevent_freeze_params: []
+
+  perception:
+    use_multi_layer_feat: false
+    aggregation: null
+    encoder:
+      _target_: nemo.collections.asr.modules.ConformerEncoder
+      feat_in: 80
+      feat_out: -1
+      n_layers: 17
+      d_model: 512
+      subsampling: dw_striding
+      subsampling_factor: 8
+      subsampling_conv_channels: 256
+      self_attention_model: rel_pos
+      n_heads: 8
+      att_context_size: [70, 0]
+      att_context_style: regular
+      ff_expansion_factor: 4
+      xscaling: true
+      untie_biases: true
+      pos_emb_max_len: 5000
+      conv_kernel_size: 31
+      conv_norm_type: layer_norm
+      conv_context_size: causal
+      dropout: 0.1
+      dropout_emb: 0.0
+      dropout_att: 0.1
+    modality_adapter:
+      _target_: nemo.collections.asr.modules.ConformerEncoder
+      feat_in: 512
+      feat_out: -1
+      n_layers: 2
+      d_model: 512
+      subsampling: dw_striding
+      subsampling_factor: 2
+      subsampling_conv_channels: 256
+      self_attention_model: rel_pos
+      n_heads: 8
+      att_context_size: [70, 0]
+      att_context_style: regular
+      ff_expansion_factor: 4
+      xscaling: false
+      untie_biases: true
+      pos_emb_max_len: 5000
+      conv_kernel_size: 31
+      conv_norm_type: layer_norm
+      conv_context_size: causal
+      dropout: 0.1
+      dropout_emb: 0.0
+      dropout_att: 0.1
+    output_dim: 3072
+
+  codec_config:
+    latent_size: 512
+    n_fft: 16
+    hop_length: 4
+    base_hidden_size: 384
+    channel_mult: [1, 2, 4]
+    rates: [7, 7, 9]
+    num_blocks: 3
+    kernel_size: 7
+    groups: 1
+    codebook_size: 1024
+    num_quantizers: 31
+    wav_to_token_ratio: 1764
+
+  tts_config:
+    context_hidden_size: 3072
+    use_gated_fusion_for_text_audio: true
+    disable_eos_prediction: true
+    use_bos_eos_emb: true
+    use_subword_flag_emb: true
+    num_delay_speech_tokens: 2
+    backbone_type: gemma3_text
+    backbone_model_class: null
+    backbone_config_class: null
+    backbone_config:
+      hidden_size: 1152
+      intermediate_size: 4608
+      num_hidden_layers: 28
+      num_attention_heads: 16
+      num_key_value_heads: 16
+      head_dim: 72
+      attention_dropout: 0.1
+      use_cache: false
+    latent_size: 512
+    codebook_size: 1024
+    num_quantizers: 31
+    cas_config:
+      backbone_type: null
+      backbone_model_class: BertModel
+      backbone_config_class: BertConfig
+      backbone_config:
+        hidden_size: 1152
+        num_hidden_layers: 1
+        num_attention_heads: 16
+        intermediate_size: 4608
+        hidden_dropout_prob: 0.1
+        attention_probs_dropout_prob: 0.1
+        max_position_embeddings: 512
+        vocab_size: 131072
+    mog_head_config:
+      intermediate_size: 4608
+      num_layers: 3
+      low_rank: 64
+      num_predictions: 1024
+      min_log_std: -4.0
+      eps: 1e-06
+    p_uncond: 0.1
+    label_smoothing: 0.01
+    max_training_rate: 0.8
+    quantizer_dropout: 0.5
+    random_target_masking: false
+    exponent: 3.0
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4
+    betas: [0.9, 0.98]
+    weight_decay: 0.0
+    foreach: true
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.InverseSquareRootAnnealing
+    warmup_steps: 4000
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: false
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 5
+  val_check_interval: 5
+  limit_train_batches: 5
+  limit_val_batches: 0
+  log_every_n_steps: 1
+  num_sanity_val_steps: 0
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+data:
+  add_text_bos_and_eos_in_each_turn: true
+  add_audio_prompt_after_description: true
+  audio_prompt_duration: 3.0
+  frame_length: 0.08
+  source_sample_rate: 22050
+  target_sample_rate: 22050
+  input_roles: ["user", "User"]
+  output_roles: ["agent", "Assistant", "assistant", "Agent"]
+
+  train_ds:
+    sample_rate: ${data.target_sample_rate}
+    multi_config: true
+    shuffle: true
+    sampler_fusion: randomized_round_robin
+    seed: 42
+    shard_seed: "trng"
+    num_workers: 2
+    pin_memory: true
+    sampler_weights:
+      de: 1.0
+    de:
+      # Single bucket for fast debug — minimal data loading
+      input_cfg: /lustre/fsw/portfolios/edgeai/users/hdubey/gitlab_apr2026/s2s_st_scripts/s2s_exp/de/configs/data/riva_de_en_st_concat_v_mfa_target_aligned.yaml
+      bucket_buffer_size: 200
+      shuffle_buffer_size: 200
+      max_duration: 30
+      min_duration: 1
+      num_buckets: 5
+      batch_duration: 100
+      batch_size: 2
+      use_bucketing: true
+      seed: "trng"
+
+  validation_ds:
+    datasets:
+      cvss-DeTest:
+        shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test
+    sample_rate: ${data.target_sample_rate}
+    batch_size: 1
+    num_workers: 2
+    pin_memory: true
+    seed: 42
+    shard_seed: "randomized"
+
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: /lustre/fsw/portfolios/edgeai/users/hdubey/s2s_exp/s2s_model/vt_v2_debug_de
+  name: vt_v2_debug_de
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  use_datetime_version: false
+  max_time_per_run: "00:00:30:00"
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+  create_wandb_logger: true
+  wandb_logger_kwargs:
+    name: vt_v2_debug_de
+    project: duplex_s2s_st_eartts
+    entity: riva-nemo-llm-mlops
+    resume: true
+  checkpoint_callback_params:
+    filename: "step{step}"
+    monitor: val/total_loss
+    mode: min
+    every_n_train_steps: 2
+    every_n_epochs: 0
+    save_top_k: -1
+    always_save_nemo: false

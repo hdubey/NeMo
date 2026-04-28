@@ -24,9 +24,12 @@
 model:
   pretrained_lm_name: "/lustre/fsw/portfolios/edgeai/users/amhussein/cache/HFCACHE/hub/models--nvidia--Riva-Translate-4B-Instruct-v1.1/snapshots/f859e48c4c82696c5929cd06590f600a41dc7f3c"
 
-  # TODO: obtain from Edresson once available
-  pretrained_codec_model: null
-  pretrained_tts_model: null
+  # EarTTS pretrained checkpoints from Edresson (ecasanova).
+  # tts_model: eartts_rvq_cont_task (Gemma3-1B + 31-codebook RVQ, 5.2GB) — tts_model.* keys load directly.
+  # codec_model: same ckpt — audio_codec.* keys stripped and loaded into RVQVAEModel.
+  # Debug confirmed: tts_model.backbone shape=(1152,4608) = Gemma3-1B; audio_codec.decoder shape=(512,1536,9).
+  pretrained_tts_model: "/lustre/fsw/portfolios/edgeai/users/hdubey/pretrained_models/full-duplex/models/tts/ear-tts/eartts_rvq_cont_task_qwen_22khz_synthetic_duplex_data_plus_blackwell_4nodes_FT_cont_22khz_12.5FPS_text_bos_eos_fix_duplex_nanov2_new_special_tokens_no_context_emb_20366-last.ckpt"
+  pretrained_codec_model: "/lustre/fsw/portfolios/edgeai/users/hdubey/pretrained_models/full-duplex/models/tts/ear-tts/eartts_rvq_cont_task_qwen_22khz_synthetic_duplex_data_plus_blackwell_4nodes_FT_cont_22khz_12.5FPS_text_bos_eos_fix_duplex_nanov2_new_special_tokens_no_context_emb_20366-last.ckpt"
 
   scoring_asr: stt_en_fastconformer_transducer_large
 
@@ -58,7 +61,10 @@ model:
   #       so "freeze ASR encoder" (^perception.encoder) does not apply here.
   freeze_params:
     - "^audio_codec\\..+$"             # RVQVAEModel codec — always frozen
-    - "^tts_model\\.backbone\\..+$"    # Gemma3 TTS backbone — frozen for debug; unfreeze for full SFT
+    - "^tts_model\\..+$"               # Entire EarTTS model frozen; pretrained weights preserved during VT-v1 SFT
+    # To unfreeze TTS for full SFT, replace the above with:
+    #   - "^tts_model\\.backbone\\..+$"   # backbone-only freeze (Gemma3 frozen, audio heads trainable)
+    # To unfreeze everything except codec, remove the tts_model line entirely.
   prevent_freeze_params: []
 
   # Riva-4B tokenizer defaults (null = use tokenizer's own bos/eos/pad)
@@ -107,7 +113,8 @@ model:
     num_quantizers: 31
     wav_to_token_ratio: 1764
 
-  # tts_config — UNCHANGED from Edresson
+  # tts_config — UNCHANGED from Edresson (gemma3_text/hidden=1152 matches eartts_rvq_cont_task ckpt).
+  # Confirmed via debug: eartts_rvq_cont_task_...20366-last.ckpt backbone shape=(1152, 4608) = Gemma3-1B.
   tts_config:
     use_gated_fusion_for_text_audio: true
     disable_eos_prediction: true
@@ -200,14 +207,14 @@ data:
     sampler_fusion: randomized_round_robin
     seed: 42
     shard_seed: "trng"
+    num_workers: 8        # MUST be at train_ds level — multi_config gather_shared_opts() reads from here, overrides sub-configs
+    pin_memory: true      # same: shared_opts overwrites per-sub-config value
     sampler_weights:
       riva_mult: 1.0
     riva_mult:
       input_cfg: /lustre/fsw/portfolios/edgeai/users/amhussein/s2s/configs/data/riva_multiling_st_concat_v_mfa_target_aligned.yaml
       bucket_buffer_size: 2000    # reduced from 10000 — fills in ~18 min vs ~90 min
       shuffle_buffer_size: 2000
-      num_workers: 8
-      pin_memory: true
       max_duration: 60
       min_duration: 1
       num_buckets: 30
@@ -219,14 +226,58 @@ data:
 
   validation_ds:
     datasets:
+      # CVSS eval sets — MUST use these for validation, NOT training shards.
+      # Reason: force_map_dataset=True (hard-coded in datamodule) materializes cuts without loading
+      # tar files → shar-format audio sources stay as empty placeholders → load_audio() crashes.
+      # CVSS cuts use file-path recordings (not shar), so they work fine with force_map_dataset.
+      # SECS metric is meaningless (no target_audio), but ASR-BLEU is valid. See TODO_Apr16.md P0.
+      # Using 5 shards each (reduced from 20) to speed up validation while still covering ~500 samples/lang.
       cvss-FrTest:
-        shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test
+        shar_path:
+          cuts:
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/cuts.000000.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/cuts.000001.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/cuts.000002.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/cuts.000003.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/cuts.000004.jsonl.gz
+          recording:
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/recording.000000.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/recording.000001.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/recording.000002.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/recording.000003.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/recording.000004.tar
       cvss-EsTest:
-        shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test
+        shar_path:
+          cuts:
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test/cuts.000000.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test/cuts.000001.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test/cuts.000002.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test/cuts.000003.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test/cuts.000004.jsonl.gz
+          recording:
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test/recording.000000.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test/recording.000001.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test/recording.000002.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test/recording.000003.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test/recording.000004.tar
       cvss-DeTest:
-        shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test
+        shar_path:
+          cuts:
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/cuts.000000.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/cuts.000001.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/cuts.000002.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/cuts.000003.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/cuts.000004.jsonl.gz
+          recording:
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/recording.000000.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/recording.000001.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/recording.000002.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/recording.000003.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/recording.000004.tar
     sample_rate: ${data.target_sample_rate}
     batch_size: 1
+    num_workers: 4        # validation uses force_map_dataset; 4 workers parallelize shard I/O (default is 0 = single-threaded)
+    pin_memory: true
     seed: 42
     shard_seed: "randomized"
 

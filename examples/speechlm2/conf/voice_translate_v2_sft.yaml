@@ -1,0 +1,335 @@
+# VoiceTranslateV2 — End-to-End S2S Training Config
+# ===================================================
+# Model:   FastConformer + Riva-4B LLM + RVQEARTTSModel + RVQVAEModel codec
+# Stage:   SFT from random weights (no pretrained checkpoints required)
+# Data:    Multilingual CVSS (FR/ES/DE → EN) + MFA-aligned target audio
+# Launch:  sbatch train_vt_v2_sft.sh
+#
+# Architecture difference from VoiceTranslate-v1:
+#   v1: DuplexEARTTS, context_hidden_size=null  → no LLM in model (TTS-only)
+#   v2: VoiceTranslateV2, context_hidden_size=3072 → full LLM in model (true E2E)
+#
+# Hibiki-Zero-inspired choices:
+#   text_loss_weight=100  → translation text dominates early training (inner monologue)
+#   audio_loss_weight=4   → Nourchene's proven setting for EarTTS audio loss
+#   lm_loss_weight=100 propagates into RVQEARTTSModel._compute_losses via tts_config
+
+model:
+  # ------------------------------------------------------------------
+  # LLM  (Riva-Translate-4B-Instruct-v1.1)
+  # ------------------------------------------------------------------
+  pretrained_lm_name: "/lustre/fsw/portfolios/edgeai/users/amhussein/cache/HFCACHE/hub/models--nvidia--Riva-Translate-4B-Instruct-v1.1/snapshots/f859e48c4c82696c5929cd06590f600a41dc7f3c"
+  pretrained_weights: false           # true → load Riva-4B pretrained weights; false → random LLM
+
+  # ------------------------------------------------------------------
+  # Perception  (multilingual FastConformer)
+  # ------------------------------------------------------------------
+  pretrained_asr: null                # null → random FastConformer; set .nemo path to load
+
+  # ------------------------------------------------------------------
+  # TTS + Codec pretrained checkpoints
+  # ------------------------------------------------------------------
+  pretrained_tts_model: null          # null → random TTS; set path to load Edresson's ckpt
+  pretrained_codec_model: "/lustre/fsw/portfolios/edgeai/users/hdubey/pretrained_models/full-duplex/models/tts/ear-tts/eartts_rvq_cont_task_qwen_22khz_synthetic_duplex_data_plus_blackwell_4nodes_FT_cont_22khz_12.5FPS_text_bos_eos_fix_duplex_nanov2_new_special_tokens_no_context_emb_20366-last.ckpt"
+
+  # ------------------------------------------------------------------
+  # Loss weights  (Hibiki-Zero inspired)
+  # ------------------------------------------------------------------
+  text_loss_weight: 100.0     # LLM text CE loss weight (inner-monologue; Hibiki uses c_text=100)
+  audio_loss_weight: 4.0      # EarTTS total audio loss weight (Nourchene's Riva-4B setting)
+  audio_loss_type: "mog"      # MoG NLL (Edresson default; proven stable)
+  lm_loss_weight: 1.0         # EOS prediction sub-loss (within EarTTS)
+  c_loss_weight: 1.0          # MoG NLL sub-loss (within EarTTS)
+  k_loss_weight: 1.0          # KL sub-loss (within EarTTS)
+
+  # ------------------------------------------------------------------
+  # Tokenizer overrides (null = use Riva-4B tokenizer defaults)
+  # ------------------------------------------------------------------
+  bos_token: null
+  eos_token: null
+  pad_token: null
+
+  # ------------------------------------------------------------------
+  # Freeze patterns
+  # ------------------------------------------------------------------
+  # ------------------------------------------------------------------
+  # Freeze patterns — controls which Stage is active
+  # ------------------------------------------------------------------
+  # STAGE 1 (TTS warmup — current default):
+  #   Freeze LLM + codec; train TTS only.
+  #   TTS learns to condition on LLM hidden states from a frozen LLM.
+  #   ~50K steps.  Switch to Stage 2 once TTS loss plateaus.
+  freeze_params:
+    - "^audio_codec\\..+$"          # codec: always frozen
+    - "^embed_tokens\\..+$"         # LLM embedding table: frozen in Stage 1
+    - "^language_model\\..+$"       # LLM backbone: frozen in Stage 1
+    - "^lm_head\\..+$"              # LLM output head: frozen in Stage 1
+  prevent_freeze_params: []
+
+  # STAGE 2 (end-to-end SFT — uncomment and resubmit):
+  #   Unfreeze LLM; gradients flow through LLM + TTS jointly.
+  #   ~150K steps from Stage 1 checkpoint.
+  # freeze_params:
+  #   - "^audio_codec\\..+$"        # codec: always frozen
+  # prevent_freeze_params: []
+
+  # text_loss_weight: inner-monologue CE loss on LLM text predictions (Hibiki style)
+  # 0.0 in Stage 1 (LLM frozen, no gradient to lm_head)
+  # 100.0 in Stage 2 (LLM unfrozen, text loss dominates early)
+  text_loss_weight: 0.0
+
+  # ------------------------------------------------------------------
+  # Perception config  (FastConformer, causal, att_context=[70,0])
+  # ------------------------------------------------------------------
+  perception:
+    use_multi_layer_feat: false
+    aggregation: null
+    encoder:
+      _target_: nemo.collections.asr.modules.ConformerEncoder
+      feat_in: 80
+      feat_out: -1
+      n_layers: 17
+      d_model: 512
+      subsampling: dw_striding
+      subsampling_factor: 8
+      subsampling_conv_channels: 256
+      self_attention_model: rel_pos
+      n_heads: 8
+      att_context_size: [70, 0]
+      att_context_style: regular
+      ff_expansion_factor: 4
+      xscaling: true
+      untie_biases: true
+      pos_emb_max_len: 5000
+      conv_kernel_size: 31
+      conv_norm_type: layer_norm
+      conv_context_size: causal
+      dropout: 0.1
+      dropout_emb: 0.0
+      dropout_att: 0.1
+    modality_adapter:
+      _target_: nemo.collections.asr.modules.ConformerEncoder
+      feat_in: 512
+      feat_out: -1
+      n_layers: 2
+      d_model: 512
+      subsampling: dw_striding
+      subsampling_factor: 2
+      subsampling_conv_channels: 256
+      self_attention_model: rel_pos
+      n_heads: 8
+      att_context_size: [70, 0]
+      att_context_style: regular
+      ff_expansion_factor: 4
+      xscaling: false
+      untie_biases: true
+      pos_emb_max_len: 5000
+      conv_kernel_size: 31
+      conv_norm_type: layer_norm
+      conv_context_size: causal
+      dropout: 0.1
+      dropout_emb: 0.0
+      dropout_att: 0.1
+    output_dim: 3072             # Must equal LLM hidden_size
+
+  # ------------------------------------------------------------------
+  # Codec config (RVQVAEModel — must match pretrained codec ckpt)
+  # ------------------------------------------------------------------
+  codec_config:
+    latent_size: 512
+    n_fft: 16
+    hop_length: 4
+    base_hidden_size: 384
+    channel_mult: [1, 2, 4]
+    rates: [7, 7, 9]
+    num_blocks: 3
+    kernel_size: 7
+    groups: 1
+    codebook_size: 1024
+    num_quantizers: 31
+    wav_to_token_ratio: 1764
+
+  # ------------------------------------------------------------------
+  # TTS config  (RVQEARTTSModel, Gemma3-1B backbone)
+  # IMPORTANT: context_hidden_size is overridden in VoiceTranslateV2.__init__
+  #            to match LLM hidden size. Set any value here; it will be replaced.
+  # ------------------------------------------------------------------
+  tts_config:
+    context_hidden_size: 3072          # ← will be set to llm.config.hidden_size in __init__
+    use_gated_fusion_for_text_audio: true
+    disable_eos_prediction: true
+    use_bos_eos_emb: true
+    use_subword_flag_emb: true
+    num_delay_speech_tokens: 2
+    backbone_type: gemma3_text
+    backbone_model_class: null
+    backbone_config_class: null
+    backbone_config:
+      hidden_size: 1152
+      intermediate_size: 4608
+      num_hidden_layers: 28
+      num_attention_heads: 16
+      num_key_value_heads: 16
+      head_dim: 72
+      attention_dropout: 0.1
+      use_cache: false
+    latent_size: 512
+    codebook_size: 1024
+    num_quantizers: 31
+    cas_config:
+      backbone_type: null
+      backbone_model_class: BertModel
+      backbone_config_class: BertConfig
+      backbone_config:
+        hidden_size: 1152
+        num_hidden_layers: 1
+        num_attention_heads: 16
+        intermediate_size: 4608
+        hidden_dropout_prob: 0.1
+        attention_probs_dropout_prob: 0.1
+        max_position_embeddings: 512
+        vocab_size: 131072
+    mog_head_config:
+      intermediate_size: 4608
+      num_layers: 3
+      low_rank: 64
+      num_predictions: 1024
+      min_log_std: -4.0
+      eps: 1e-06
+    p_uncond: 0.1
+    label_smoothing: 0.01
+    max_training_rate: 0.8
+    quantizer_dropout: 0.5
+    random_target_masking: false
+    exponent: 3.0
+
+  # ------------------------------------------------------------------
+  # Optimizer
+  # ------------------------------------------------------------------
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4
+    betas: [0.9, 0.98]
+    weight_decay: 0.0
+    foreach: true
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.InverseSquareRootAnnealing
+    warmup_steps: 4000
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+# ------------------------------------------------------------------
+# Trainer
+# ------------------------------------------------------------------
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: false
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 200000
+  val_check_interval: 1000
+  limit_train_batches: ${trainer.val_check_interval}
+  limit_val_batches: 2
+  log_every_n_steps: 20
+  num_sanity_val_steps: 0
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+# ------------------------------------------------------------------
+# Data  (same format as VoiceTranslate-v1)
+# ------------------------------------------------------------------
+data:
+  add_text_bos_and_eos_in_each_turn: true
+  add_audio_prompt_after_description: true
+  audio_prompt_duration: 3.0
+  frame_length: 0.08
+  source_sample_rate: 22050
+  target_sample_rate: 22050
+  input_roles: ["user", "User"]
+  output_roles: ["agent", "Assistant", "assistant", "Agent"]
+
+  train_ds:
+    sample_rate: ${data.target_sample_rate}
+    multi_config: true
+    shuffle: true
+    sampler_fusion: randomized_round_robin
+    seed: 42
+    shard_seed: "trng"
+    num_workers: 8
+    pin_memory: true
+    sampler_weights:
+      riva_mult: 1.0
+    riva_mult:
+      input_cfg: /lustre/fsw/portfolios/edgeai/users/amhussein/s2s/configs/data/riva_multiling_st_concat_v_mfa_target_aligned.yaml
+      bucket_buffer_size: 2000
+      shuffle_buffer_size: 2000
+      max_duration: 60
+      min_duration: 1
+      num_buckets: 30
+      bucket_duration_bins: [5.33,6.27,6.96,7.54,8.07,8.55,8.99,9.39,9.76,10.14,10.54,10.99,11.49,12.04,12.64,13.28,13.96,14.69,15.48,16.32,17.25,18.28,19.39,20.65,22.14,24.01,26.34,29.21,32.79]
+      batch_duration: 400
+      batch_size: 4
+      use_bucketing: true
+      seed: "trng"
+
+  validation_ds:
+    datasets:
+      cvss-FrTest:
+        shar_path:
+          cuts:
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/cuts.000000.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/cuts.000001.jsonl.gz
+          recording:
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/recording.000000.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test/recording.000001.tar
+      cvss-DeTest:
+        shar_path:
+          cuts:
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/cuts.000000.jsonl.gz
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/cuts.000001.jsonl.gz
+          recording:
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/recording.000000.tar
+          - /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test/recording.000001.tar
+    sample_rate: ${data.target_sample_rate}
+    batch_size: 1
+    num_workers: 4
+    pin_memory: true
+    seed: 42
+    shard_seed: "randomized"
+
+# ------------------------------------------------------------------
+# Experiment manager
+# ------------------------------------------------------------------
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: /lustre/fsw/portfolios/edgeai/users/hdubey/s2s_exp/s2s_model/vt_v2_sft_random_weights
+  name: voice_translate_v2_sft
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  use_datetime_version: false
+  max_time_per_run: "00:03:50:00"
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+  create_wandb_logger: true
+  wandb_logger_kwargs:
+    name: vt_v2_sft_random_weights
+    project: duplex_s2s_st_eartts
+    entity: riva-nemo-llm-mlops
+    resume: true
+  checkpoint_callback_params:
+    filename: "{step}"
+    monitor: val/total_loss
+    mode: min
+    every_n_train_steps: null
+    every_n_epochs: 1
+    save_top_k: 3
+    always_save_nemo: false

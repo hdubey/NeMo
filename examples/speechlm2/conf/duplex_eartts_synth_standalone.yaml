@@ -1,0 +1,31 @@
+# Standalone EarTTS synthesis config — Edresson's tokenizer + eartts_rvq_cont_task checkpoint.
+# Used ONLY for TTS inference from text (no Riva-4B, no VoiceTranslate training).
+# Inherits all arch settings from duplex_eartts.yaml (Gemma3-1B backbone, 31-codebook RVQ).
+
+defaults:
+  - duplex_eartts
+
+model:
+  # Nemotron tokenizer (same as used during eartts_rvq_cont_task training)
+  pretrained_lm_name: "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+
+  # Edresson's pretrained EarTTS + codec checkpoint (5.2GB)
+  pretrained_tts_model: "/lustre/fsw/portfolios/edgeai/users/hdubey/pretrained_models/full-duplex/models/tts/ear-tts/eartts_rvq_cont_task_qwen_22khz_synthetic_duplex_data_plus_blackwell_4nodes_FT_cont_22khz_12.5FPS_text_bos_eos_fix_duplex_nanov2_new_special_tokens_no_context_emb_20366-last.ckpt"
+  pretrained_codec_model: "/lustre/fsw/portfolios/edgeai/users/hdubey/pretrained_models/full-duplex/models/tts/ear-tts/eartts_rvq_cont_task_qwen_22khz_synthetic_duplex_data_plus_blackwell_4nodes_FT_cont_22khz_12.5FPS_text_bos_eos_fix_duplex_nanov2_new_special_tokens_no_context_emb_20366-last.ckpt"
+  pretrained_audio_codec: null
+
+  # Nemotron-specific tokens (as trained by Edresson)
+  bos_token: "<s>"
+  eos_token: "</s>"
+  pad_token: "<SPECIAL_12>"
+
+  # No freezing needed for inference-only
+  freeze_params: []
+
+  # Override to match what the checkpoint was actually trained with.
+  # The checkpoint has tts_model.bos_emb as a raw [1152] parameter tensor,
+  # NOT a BOSEOSEmbedding module; and no gated_fusion or flag_emb modules.
+  tts_config:
+    use_gated_fusion_for_text_audio: false
+    use_bos_eos_emb: false
+    use_subword_flag_emb: false

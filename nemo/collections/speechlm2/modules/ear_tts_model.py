@@ -1098,6 +1098,8 @@ class RVQEARTTSModel(nn.Module):
             if self.config.context_hidden_size
             else None
         )
+        if self.embed_context is not None:
+            nn.init.normal_(self.embed_context.weight, mean=0.0, std=0.01)
 
         self.embed_subword = (
             CharAwareSubwordEncoder(
@@ -1193,7 +1195,13 @@ class RVQEARTTSModel(nn.Module):
         device = code.device
 
         ret = torch.zeros((b, t, h), device=device)
-        embs = F.pad(self.rvq_embs, [0, 0, 0, 1])
+        # Pad 4 extra rows: speech_pad(+0), speech_eos(+1), speech_bos(+2), nar_mask(+3)
+        embs = F.pad(self.rvq_embs, [0, 0, 0, 4])
+        max_valid = v + 3
+        code_max = int(code.max().item())
+        if code_max > max_valid:
+            print(f"[DEPTHSUM OOB] max={code_max} valid_range=[0,{max_valid}] shape={list(code.shape)}", flush=True)
+        code = code.clamp(0, max_valid)
         for i in range(d):
             emb = embs[i]
             ret = ret + F.embedding(code[..., i], emb)
@@ -1575,6 +1583,10 @@ class RVQEARTTSModel(nn.Module):
             inputs_embeds = inputs_embeds + self.prompt_channel_proj(fused_tiled_prompt)
 
         # Main backbone pass
+        # Gemma3 sliding-window layers require float attention_mask; 4D int masks from
+        # aligned_attention_mask pass through _prepare_4d_causal_attention_mask unchanged.
+        if attention_mask is not None and not attention_mask.is_floating_point():
+            attention_mask = attention_mask.to(dtype=inputs_embeds.dtype)
         backbone_outputs = self.backbone(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
