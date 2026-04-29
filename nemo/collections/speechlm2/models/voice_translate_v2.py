@@ -279,44 +279,147 @@ class VoiceTranslateV2(DuplexEARTTS):
 # GRPO helpers (inlined from grpo_voicetranslate_v1.py to stay self-contained)
 # ──────────────────────────────────────────────────────────────────────────────
 
-class _ASRBLEUReward:
-    """ASR-BLEU reward: codec tokens → audio → ASR → BLEU vs EN reference."""
+class _S2SReward:
+    """
+    Multi-component GRPO reward: BLEU + NISQA (audio quality) + TitaNet cosine (speaker sim).
 
-    def __init__(self, asr_model_name: str, device: str = "cuda", utmos_weight: float = 0.0):
+    reward = bleu_weight * BLEU
+           + nisqa_weight * NISQA_norm      (NISQA MOS normalised to [0,1])
+           + spk_sim_weight * SpkCosim_norm (TitaNet cosine normalised to [0,1])
+
+    All components are individually normalised to [0,1] before weighting so
+    the absolute weights determine relative importance.  Components that fail to
+    load fall back to 0.0 contribution with a warning.
+
+    Ablation presets (set via grpo config):
+      A (BLEU only):           bleu_weight=1.0, nisqa_weight=0.0, spk_sim_weight=0.0
+      B (BLEU + quality):      bleu_weight=0.7, nisqa_weight=0.3, spk_sim_weight=0.0
+      C (BLEU + qual + spk):   bleu_weight=0.6, nisqa_weight=0.2, spk_sim_weight=0.2
+    """
+
+    def __init__(
+        self,
+        asr_model_name: str,
+        device: str = "cuda",
+        bleu_weight: float = 1.0,
+        nisqa_weight: float = 0.0,
+        spk_sim_weight: float = 0.0,
+    ):
         import nemo.collections.asr as nemo_asr
         import sacrebleu as sb
         self._sb = sb
-        self.utmos_weight = utmos_weight
+        self.device = device
+        self.bleu_weight = bleu_weight
+        self.nisqa_weight = nisqa_weight
+        self.spk_sim_weight = spk_sim_weight
+
+        logging.info(
+            "[GRPO] Reward weights — BLEU:%.2f  NISQA:%.2f  SpkSim:%.2f",
+            bleu_weight, nisqa_weight, spk_sim_weight,
+        )
+
         logging.info("[GRPO] Loading ASR reward model: %s", asr_model_name)
         self.asr = nemo_asr.models.EncDecRNNTModel.from_pretrained(asr_model_name)
         self.asr.to(device).eval()
         for p in self.asr.parameters():
             p.requires_grad_(False)
-        self.device = device
-        self.utmos = None
-        if utmos_weight > 0.0:
+
+        # NISQA audio quality model (MOS 1-5 → normalised [0,1])
+        self.nisqa = None
+        if nisqa_weight > 0.0:
             try:
-                import utmos
-                self.utmos = utmos.UTMOSScore(device=device)
-            except ImportError:
-                logging.warning("[GRPO] utmos not installed; skipping UTMOS reward.")
+                from nisqa.NISQA_model import nisqaModel  # pip install nisqa
+                self.nisqa = nisqaModel(pretrained_model="nisqa_mos", device=device)
+                logging.info("[GRPO] NISQA loaded.")
+            except Exception as exc:
+                logging.warning("[GRPO] NISQA unavailable (%s); nisqa_weight zeroed.", exc)
+                self.nisqa_weight = 0.0
+
+        # TitaNet speaker embedding model for cosine speaker similarity
+        self.titanet = None
+        if spk_sim_weight > 0.0:
+            try:
+                self.titanet = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(
+                    "titanet_large"
+                )
+                self.titanet.to(device).eval()
+                for p in self.titanet.parameters():
+                    p.requires_grad_(False)
+                logging.info("[GRPO] TitaNet speaker model loaded.")
+            except Exception as exc:
+                logging.warning("[GRPO] TitaNet unavailable (%s); spk_sim_weight zeroed.", exc)
+                self.spk_sim_weight = 0.0
+
+    def _speaker_emb(self, audio_np, src_sr: int):
+        """Return L2-normalised TitaNet embedding (1-D CPU tensor) or None."""
+        if self.titanet is None:
+            return None
+        try:
+            import numpy as np
+            import librosa
+            audio_16k = librosa.resample(audio_np.astype(float), orig_sr=src_sr, target_sr=16000).astype("float32")
+            sig = torch.from_numpy(audio_16k).unsqueeze(0).to(self.device)
+            sig_len = torch.tensor([sig.shape[1]], device=self.device)
+            _, emb = self.titanet(audio_signal=sig, audio_signal_length=sig_len)
+            emb = emb.squeeze(0)
+            return emb / (emb.norm() + 1e-8)
+        except Exception as exc:
+            logging.warning("[GRPO] TitaNet embedding failed: %s", exc)
+            return None
 
     @torch.no_grad()
-    def __call__(self, audio_list: list, ref_texts: list, sample_rate: int = 22050) -> list:
+    def __call__(
+        self,
+        audio_list: list,
+        ref_texts: list,
+        sample_rate: int = 22050,
+        prompt_audio_list=None,
+    ) -> list:
+        import numpy as np
         audio_np = [a.float().cpu().numpy() for a in audio_list]
+
         hyps = self.asr.transcribe(audio_np, batch_size=len(audio_np))
         if isinstance(hyps, (list, tuple)) and isinstance(hyps[0], (list, tuple)):
             hyps = hyps[0]
+
         rewards = []
         for i, (hyp, ref) in enumerate(zip(hyps, ref_texts)):
             bleu = self._sb.corpus_bleu(
                 [str(hyp)], [[str(ref)]], tokenize="13a", smooth_method="exp"
             ).score / 100.0
-            if self.utmos is not None and self.utmos_weight > 0.0:
-                mos = (self.utmos.score(audio_np[i], sample_rate) - 1.0) / 4.0
-                bleu = (1 - self.utmos_weight) * bleu + self.utmos_weight * mos
-            rewards.append(bleu)
+
+            nisqa_norm = 0.0
+            if self.nisqa is not None and self.nisqa_weight > 0.0:
+                try:
+                    raw = self.nisqa.predict_from_array(audio_np[i], sample_rate)
+                    nisqa_norm = float(np.clip((float(raw) - 1.0) / 4.0, 0.0, 1.0))
+                except Exception as exc:
+                    logging.warning("[GRPO] NISQA scoring failed: %s", exc)
+
+            spk_norm = 0.0
+            if self.titanet is not None and self.spk_sim_weight > 0.0 and prompt_audio_list is not None:
+                gen_emb = self._speaker_emb(audio_np[i], sample_rate)
+                p_audio = prompt_audio_list[i]
+                if isinstance(p_audio, torch.Tensor):
+                    p_audio = p_audio.float().cpu().numpy()
+                ref_emb = self._speaker_emb(p_audio, sample_rate)
+                if gen_emb is not None and ref_emb is not None:
+                    cosim = torch.nn.functional.cosine_similarity(
+                        gen_emb.unsqueeze(0), ref_emb.unsqueeze(0)
+                    ).item()
+                    spk_norm = float(np.clip((cosim + 1.0) / 2.0, 0.0, 1.0))
+
+            reward = (
+                self.bleu_weight * bleu
+                + self.nisqa_weight * nisqa_norm
+                + self.spk_sim_weight * spk_norm
+            )
+            rewards.append(reward)
         return rewards
+
+
+# Keep alias for backward compatibility with any external callers
+_ASRBLEUReward = _S2SReward
 
 
 def _grpo_policy_loss(
@@ -417,7 +520,7 @@ class VoiceTranslateV2Stages(VoiceTranslateV2):
 
         # GRPO internals (lazy-init at Stage 3)
         self._ref_tts: Optional[torch.nn.Module] = None
-        self._reward_fn: Optional[_ASRBLEUReward] = None
+        self._reward_fn: Optional[_S2SReward] = None
 
         gcfg = self.cfg.get("grpo", {})
         self.G              = int(gcfg.get("num_generations", 8))
@@ -425,7 +528,9 @@ class VoiceTranslateV2Stages(VoiceTranslateV2):
         self.eps_clip       = float(gcfg.get("eps_clip", 0.2))
         self.gen_max_steps  = int(gcfg.get("gen_max_steps", 500))
         self.reward_clip    = gcfg.get("reward_clip", None)
-        self.utmos_weight   = float(gcfg.get("utmos_weight", 0.0))
+        self.bleu_weight    = float(gcfg.get("bleu_weight", 1.0))
+        self.nisqa_weight   = float(gcfg.get("nisqa_weight", 0.0))
+        self.spk_sim_weight = float(gcfg.get("spk_sim_weight", 0.0))
         self._scoring_asr   = self.cfg.get(
             "scoring_asr", "stt_en_fastconformer_transducer_large"
         )
@@ -497,10 +602,12 @@ class VoiceTranslateV2Stages(VoiceTranslateV2):
                 p.requires_grad_(False)
             self._ref_tts.eval()
         if self._reward_fn is None:
-            self._reward_fn = _ASRBLEUReward(
+            self._reward_fn = _S2SReward(
                 self._scoring_asr,
                 device=str(self.device),
-                utmos_weight=self.utmos_weight,
+                bleu_weight=self.bleu_weight,
+                nisqa_weight=self.nisqa_weight,
+                spk_sim_weight=self.spk_sim_weight,
             )
 
     # ── training dispatch ──────────────────────────────────────────────────
@@ -581,6 +688,11 @@ class VoiceTranslateV2Stages(VoiceTranslateV2):
             logging.warning("[GRPO] No reference texts in batch — reward will be zero.")
             ref_texts = [""] * B
 
+        # Speaker prompt audio for speaker-similarity reward (audio_prompt is [B, T_audio])
+        prompt_audios = None
+        if "audio_prompt" in batch and self.spk_sim_weight > 0.0:
+            prompt_audios = [batch["audio_prompt"][b] for b in range(B)]
+
         all_losses, all_stats = [], []
         for b in range(B):
             single = {k: (v[b:b+1] if isinstance(v, torch.Tensor) else v)
@@ -589,11 +701,13 @@ class VoiceTranslateV2Stages(VoiceTranslateV2):
             # Phase 1: generate G samples (no_grad)
             gen_codes = [self._generate_codes(single) for _ in range(self.G)]
 
-            # Phase 2: ASR-BLEU rewards
+            # Phase 2: multi-component rewards (BLEU + optional NISQA + optional SpkSim)
             audios   = [self._codes_to_audio(c) for c in gen_codes]
+            prompt_for_b = ([prompt_audios[b]] * self.G) if prompt_audios is not None else None
             rewards  = self._reward_fn(
                 audios, [ref_texts[b]] * self.G,
                 sample_rate=self.target_sample_rate,
+                prompt_audio_list=prompt_for_b,
             )
 
             # Phase 3: NLL under policy (grad) and reference (no_grad)
